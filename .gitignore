@@ -1,0 +1,45 @@
+# ---- Unreal Engine generated folders ----
+Binaries/
+Binaries_BACKUP/
+DerivedDataCache/
+Intermediate/
+Saved/
+Build/
+
+# ---- IDE / editor ----
+.vs/
+.vscode/
+.idea/
+*.sln
+*.slnx
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+
+# ---- OS ----
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ---- Editor tooling plugins (not part of the game) ----
+Plugins/
+
+# ---- Third-party / downloaded art, excluded to keep the repo lean ----
+# Character meshes and animation clips are external downloads (Mixamo) and are
+# not redistributed here. Everything the project itself authors is committed.
+Content/Football/Models/Footballer/
+Content/Football/Models/GK/
+Content/Football/Animations/
+
+# ---- Unreal starter / template content ----
+Content/Characters/
+Content/ThirdPerson/
+Content/LevelPrototyping/
+Content/StarterContent/
+Content/Tests/
+Content/Collections/
+Content/Developers/
+Content/__ExternalActors__/ThirdPerson/
+Content/__ExternalObjects__/ThirdPerson/
