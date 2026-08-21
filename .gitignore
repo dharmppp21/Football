@@ -43,3 +43,18 @@ Content/Collections/
 Content/Developers/
 Content/__ExternalActors__/ThirdPerson/
 Content/__ExternalObjects__/ThirdPerson/
+
+# ---- Code-graph tooling output (generated, machine-specific) ----
+graphify-out/
+.graphify_python
+.graphify_analysis.json
+.graphify_labels.json
+
+# ---- Local assistant / editor tooling config ----
+.claude/
+CLAUDE.md
+AGENTS.md
+
+# ---- Local design + explainer docs, not part of the build ----
+docs/
+*.html
