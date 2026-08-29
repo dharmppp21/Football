@@ -58,3 +58,9 @@ AGENTS.md
 # ---- Local design + explainer docs, not part of the build ----
 docs/
 *.html
+
+# ---- MetaHuman Capture Manager staging output ----
+# Raw video-capture ingest artifacts (mocap solve, capture data, imported
+# meshes/anims derived from a source video) - pipeline staging, not
+# hand-authored source, and may contain personal capture footage.
+Content/CaptureManager/
