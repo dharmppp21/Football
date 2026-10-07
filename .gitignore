@@ -64,3 +64,6 @@ docs/
 # meshes/anims derived from a source video) - pipeline staging, not
 # hand-authored source, and may contain personal capture footage.
 Content/CaptureManager/
+
+# ---- Python bytecode from the editor tools ----
+__pycache__/

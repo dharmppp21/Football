@@ -11,6 +11,11 @@
 			"AdditionalDependencies": [
 				"Engine"
 			]
+		},
+		{
+			"Name": "FootballArenaEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
 		}
 	],
 	"Plugins": [
