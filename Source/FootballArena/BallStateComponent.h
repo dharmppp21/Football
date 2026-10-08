@@ -10,7 +10,10 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnBallOwnerChanged, AActor*, NewOw
 
 // The ball's state machine (doc §12) and its owner (doc §30). They are kept apart on purpose: a player
 // still owns a ball that is Free (knocked ahead) or Shooting. The owner only changes when another character
-// takes the ball (Controlled, SkillControlled, Receiving, Passing, Shooting) or on ResetState.
+// takes the ball (Controlled, SkillControlled, Receiving, Passing, Shooting, GoalkeeperControlled) or on ResetState.
+// Spec §4 entry / update / exit: entry = SetState (OnBallStateChanged), update = UBallMovementComponent::UpdateAutoState
+// (ground contact, launch / deflection timers, the SkillControlled / Receiving time limits), exit = the OldState passed
+// to OnBallStateChanged.
 UCLASS(ClassGroup = (Football), meta = (BlueprintSpawnableComponent))
 class FOOTBALLARENA_API UBallStateComponent : public UActorComponent {
 	GENERATED_BODY()

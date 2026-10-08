@@ -6,7 +6,7 @@ DEFINE_LOG_CATEGORY_STATIC(LogFootballBall, Log, All);
 
 static bool TakesTheBall(EBallState State) {
 	return State == EBallState::Controlled || State == EBallState::SkillControlled || State == EBallState::Receiving
-		|| State == EBallState::Passing || State == EBallState::Shooting;
+		|| State == EBallState::Passing || State == EBallState::Shooting || State == EBallState::GoalkeeperControlled;
 }
 
 bool UBallStateComponent::IsTransitionAllowed(EBallState From, EBallState To) {
@@ -16,7 +16,13 @@ bool UBallStateComponent::IsTransitionAllowed(EBallState From, EBallState To) {
 		return From == EBallState::Free || From == EBallState::Controlled || From == EBallState::Receiving || From == EBallState::Airborne;
 	case EBallState::Receiving:
 		// Nobody receives a ball that is already under control.
-		return From != EBallState::Controlled && From != EBallState::SkillControlled;
+		return From != EBallState::Controlled && From != EBallState::SkillControlled && From != EBallState::GoalkeeperControlled;
+	case EBallState::GoalkeeperControlled:
+		// A catch is physical -> receiving -> captured (spec §128).
+		return From == EBallState::Receiving;
+	case EBallState::Controlled:
+		// The dribble never picks up a ball a goalkeeper holds.
+		return From != EBallState::GoalkeeperControlled;
 	default:
 		// Free / Airborne / Deflected: physics can always take over. Controlled: the dribble picks up any loose ball
 		// (as the Blueprint possession does today, airborne included). Passing / Shooting: any strike, first-time included.

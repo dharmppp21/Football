@@ -6,8 +6,15 @@
 #include "Components/SphereComponent.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/World.h"
+#include "Physics/Experimental/PhysScene_Chaos.h"
 #include "PhysicsEngine/BodyInstance.h"
 #include "PlayerBallInteractionComponent.h"
+
+static TAutoConsoleVariable<int32> CVarFootballDebugPhysics(TEXT("fb.Debug.Physics"), 0,
+	TEXT("1 = draw every arbitrated response command at the ball for 1 s: green = applied (arrow = the impulse or velocity change), red = dropped."));
+static TAutoConsoleVariable<int32> CVarFootballDebugBall(TEXT("fb.Debug.Ball"), 0,
+	TEXT("1 = draw the ball's velocity (yellow), spin axis (magenta, longer = faster) and state, speed and spin."));
+static constexpr int32 MaxHistory = 64;
 
 TAutoConsoleVariable<int32> CVarFootballDebugContacts(TEXT("fb.Debug.Contact"), 0,
 	TEXT("1 = draw every body contact the ball handles (body point red, normal blue, velocity in yellow / out green, with region and priority) and a running skill's contact: its region's previous point and path this tick (yellow) and where the sweep meets the ball (cyan)."));
@@ -28,6 +35,19 @@ void UBallInteractionComponent::BeginPlay() {
 	if (BallState) {
 		BallState->OnBallStateChanged.AddDynamic(this, &UBallInteractionComponent::OnBallStateChanged);
 	}
+	// The arbitration point (spec §147, §148): once per frame, after every pre-physics tick, just before the step.
+	if (FPhysScene_Chaos* Scene = GetWorld()->GetPhysicsScene()) {
+		PreTickHandle = Scene->OnPhysScenePreTick.AddUObject(this, &UBallInteractionComponent::OnPhysScenePreTick);
+	}
+}
+
+void UBallInteractionComponent::EndPlay(const EEndPlayReason::Type EndPlayReason) {
+	if (FPhysScene_Chaos* Scene = GetWorld() ? GetWorld()->GetPhysicsScene() : nullptr) {
+		Scene->OnPhysScenePreTick.Remove(PreTickHandle);
+	}
+	PreTickHandle.Reset();
+	PendingCommands.Reset();
+	Super::EndPlay(EndPlayReason);
 }
 
 EContactPriority UBallInteractionComponent::ControllingStatePriority() const {
@@ -36,9 +56,118 @@ EContactPriority UBallInteractionComponent::ControllingStatePriority() const {
 	}
 	switch (BallState->GetState()) {
 	case EBallState::Controlled: return EContactPriority::Dribble;
-	case EBallState::SkillControlled:
-	case EBallState::Receiving: return EContactPriority::Skill;
+	case EBallState::Receiving: return EContactPriority::Receive;
+	case EBallState::SkillControlled: return EContactPriority::Skill;
+	case EBallState::GoalkeeperControlled: return EContactPriority::Capture;
 	default: return EContactPriority::None;
+	}
+}
+
+bool UBallInteractionComponent::SubmitResponse(const FBallResponseCommand& Command) {
+	const int32 Best = PickWinningCommand(PendingCommands);
+	const bool bLeads = Best == INDEX_NONE || uint8(Command.Priority) >= uint8(PendingCommands[Best].Priority);
+	PendingCommands.Add(Command);
+	return bLeads;
+}
+
+int32 UBallInteractionComponent::PickWinningCommand(const TArray<FBallResponseCommand>& Commands) {
+	int32 Best = INDEX_NONE;
+	for (int32 i = 0; i < Commands.Num(); ++i) {
+		if (Best == INDEX_NONE || uint8(Commands[i].Priority) >= uint8(Commands[Best].Priority)) {
+			Best = i;
+		}
+	}
+	return Best;
+}
+
+void UBallInteractionComponent::GetPendingMotion(FVector& Velocity, FVector& AngularVelocityDeg) const {
+	const UPrimitiveComponent* Body = Cast<UPrimitiveComponent>(GetOwner()->GetRootComponent());
+	Velocity = Body ? Body->GetPhysicsLinearVelocity() : FVector::ZeroVector;
+	AngularVelocityDeg = Body ? Body->GetPhysicsAngularVelocityInDegrees() : FVector::ZeroVector;
+	const int32 Winner = PickWinningCommand(PendingCommands);
+	if (Winner == INDEX_NONE) {
+		return;
+	}
+	const FBallResponseCommand& C = PendingCommands[Winner];
+	if (C.bUseDesiredVelocity) {
+		Velocity = C.MaxAllowedCorrection > 0.f ? Velocity + (C.DesiredVelocity - Velocity).GetClampedToMaxSize(C.MaxAllowedCorrection) : C.DesiredVelocity;
+	}
+	if (C.bSetAngularVelocity) {
+		AngularVelocityDeg = C.AngularVelocityDeg;
+	}
+}
+
+void UBallInteractionComponent::OnPhysScenePreTick(FPhysScene_Chaos* Scene, float DeltaTime) {
+	// a command queued in the frame of a respawn (BP ResetBall) still lands after it; clear the queue there once
+	// the respawn moves to C++ (master plan 7.2).
+	if (PendingCommands.Num() == 0) {
+		return;
+	}
+	const TArray<FBallResponseCommand> Commands = MoveTemp(PendingCommands);
+	PendingCommands.Reset();
+	const int32 Winner = PickWinningCommand(Commands);
+	const UPrimitiveComponent* Body = Cast<UPrimitiveComponent>(GetOwner()->GetRootComponent());
+	const FVector Before = Body ? Body->GetPhysicsLinearVelocity() : FVector::ZeroVector;
+	for (int32 i = 0; i < Commands.Num(); ++i) {
+		if (i != Winner) {
+			LogCommand(Commands[i], false, FString::Printf(TEXT("dropped: %s has priority"), *Commands[Winner].Source.ToString()), Before);
+		}
+	}
+	ApplyCommand(Commands[Winner]);
+	LogCommand(Commands[Winner], true, TEXT("applied"), Before);
+}
+
+void UBallInteractionComponent::ApplyCommand(const FBallResponseCommand& C) {
+	UPrimitiveComponent* Body = Cast<UPrimitiveComponent>(GetOwner()->GetRootComponent());
+	if (!Body || !Body->IsSimulatingPhysics()) {
+		return;
+	}
+	if (!C.LinearImpulse.IsZero()) {
+		if (C.bImpulseAtContactPoint && !C.bVelocityChange) {
+			Body->AddImpulseAtLocation(C.LinearImpulse, C.ContactPoint); // the engine adds the spin from the offset
+		} else {
+			Body->AddImpulse(C.LinearImpulse, NAME_None, C.bVelocityChange);
+		}
+	}
+	if (!C.AngularImpulse.IsZero()) {
+		Body->AddAngularImpulseInRadians(C.AngularImpulse, NAME_None, C.bVelocityChange);
+	}
+	if (C.bUseDesiredVelocity) {
+		const FVector Current = Body->GetPhysicsLinearVelocity();
+		Body->SetPhysicsLinearVelocity(C.MaxAllowedCorrection > 0.f
+			? Current + (C.DesiredVelocity - Current).GetClampedToMaxSize(C.MaxAllowedCorrection) : C.DesiredVelocity);
+	}
+	if (C.bSetAngularVelocity) {
+		Body->SetPhysicsAngularVelocityInDegrees(C.AngularVelocityDeg);
+	}
+	if (C.bSetStateAfter && BallState) {
+		BallState->SetState(C.BallStateAfter, C.OwnerAfter);
+	}
+}
+
+void UBallInteractionComponent::LogCommand(const FBallResponseCommand& C, bool bApplied, const FString& Note, const FVector& VelocityBefore) {
+	FBallCommandRecord& Record = CommandLog.AddDefaulted_GetRef();
+	Record.Time = float(GetWorld()->GetTimeSeconds());
+	Record.Source = C.Source;
+	Record.Instigator = GetNameSafe(C.Instigator);
+	Record.ResponseType = C.ResponseType;
+	Record.Priority = C.Priority;
+	Record.bApplied = bApplied;
+	Record.Note = Note;
+	Record.LinearImpulse = C.LinearImpulse;
+	Record.DesiredVelocity = C.DesiredVelocity;
+	Record.VelocityBefore = VelocityBefore;
+	if (CommandLog.Num() > MaxHistory) {
+		CommandLog.RemoveAt(0);
+	}
+	if (CVarFootballDebugPhysics.GetValueOnGameThread() != 0) {
+		const FVector Center = GetOwner()->GetActorLocation();
+		if (bApplied) {
+			const FVector Change = C.bUseDesiredVelocity ? C.DesiredVelocity - VelocityBefore : C.LinearImpulse;
+			DrawDebugDirectionalArrow(GetWorld(), Center, Center + Change * 0.05, 6.f, FColor::Green, false, 1.f);
+		}
+		DrawDebugString(GetWorld(), Center + FVector(0.0, 0.0, bApplied ? 40.0 : 55.0), FString::Printf(TEXT("%s %s: %s"),
+			*C.Source.ToString(), *UEnum::GetDisplayValueAsText(C.Priority).ToString(), *Note), nullptr, bApplied ? FColor::Green : FColor::Red, 1.f);
 	}
 }
 
@@ -75,7 +204,7 @@ bool UBallInteractionComponent::TryClaim(EContactPriority Priority, AActor* Inst
 
 void UBallInteractionComponent::OnBallStateChanged(EBallState OldState, EBallState NewState, AActor* Instigator) {
 	const bool bWasHeld = OldState == EBallState::Controlled || OldState == EBallState::SkillControlled
-		|| OldState == EBallState::Passing || OldState == EBallState::Shooting;
+		|| OldState == EBallState::Passing || OldState == EBallState::Shooting || OldState == EBallState::GoalkeeperControlled;
 	const bool bNowLoose = NewState == EBallState::Free || NewState == EBallState::Airborne || NewState == EBallState::Deflected;
 	if (bWasHeld && bNowLoose) {
 		OwnerReleaseTime = GetWorld()->GetTimeSeconds();
@@ -109,7 +238,8 @@ void UBallInteractionComponent::OnBallBeginOverlap(UPrimitiveComponent* Overlapp
 		BodyPoint = Closest;
 		Normal = (Center - Closest).GetSafeNormal();
 	}
-	const FVector VelocityIn = OverlappedComponent->GetPhysicsLinearVelocity();
+	FVector VelocityIn, SpinIn;
+	GetPendingMotion(VelocityIn, SpinIn); // a second contact in this frame responds to the first one's result
 	const FVector BodyVelocity = OtherActor->GetVelocity();
 	const EContactPriority Priority = UBallContactResolver::IsFootRegion(Region) ? EContactPriority::Foot : EContactPriority::Body;
 
@@ -117,7 +247,7 @@ void UBallInteractionComponent::OnBallBeginOverlap(UPrimitiveComponent* Overlapp
 	if (OtherActor == BallState->GetBallOwner()) {
 		const EBallState State = BallState->GetState();
 		const bool bHeld = State == EBallState::Controlled || State == EBallState::SkillControlled
-			|| State == EBallState::Passing || State == EBallState::Shooting;
+			|| State == EBallState::Passing || State == EBallState::Shooting || State == EBallState::GoalkeeperControlled;
 		if (bHeld || GetWorld()->GetTimeSeconds() - OwnerReleaseTime < OwnerGraceTime) {
 			RecordContact(OtherActor, Region, Priority, false, TEXT("own body, ignored"), BodyPoint, Normal, Row->Radius, VelocityIn, VelocityIn);
 			return;
@@ -136,7 +266,7 @@ void UBallInteractionComponent::OnBallBeginOverlap(UPrimitiveComponent* Overlapp
 	const float Radius = Sphere ? Sphere->GetScaledSphereRadius() : 11.f;
 	FVector SpinOut;
 	const FVector VelocityOut = UBallContactResolver::ComputeDeflection(VelocityIn, BodyVelocity, Normal, Row->Restitution, Row->TangentDamping,
-		OverlappedComponent->GetPhysicsAngularVelocityInDegrees(), Row->SpinTransfer, Radius, SpinOut);
+		SpinIn, Row->SpinTransfer, Radius, SpinOut);
 	BallMovement->ApplyDeflection(VelocityOut, SpinOut, OtherActor);
 	RecordContact(OtherActor, Region, Priority, true, TEXT("deflected"), BodyPoint, Normal, Row->Radius, VelocityIn, VelocityOut);
 }
@@ -158,6 +288,10 @@ void UBallInteractionComponent::RecordContact(AActor* Instigator, EBodyRegion Re
 	LastContact.VelocityIn = VelocityIn;
 	LastContact.VelocityOut = VelocityOut;
 	LastContact.BallStateAfter = BallState ? BallState->GetState() : EBallState::Free;
+	ContactHistory.Add(LastContact);
+	if (ContactHistory.Num() > MaxHistory) {
+		ContactHistory.RemoveAt(0);
+	}
 	if (CVarFootballDebugContacts.GetValueOnGameThread() != 0) {
 		// Doc §33: player contact point, ball centre, calculated ball surface point, contact normal, contact
 		// radius, ball velocity in and out, ball state and contact time.
@@ -180,6 +314,18 @@ void UBallInteractionComponent::RecordContact(AActor* Instigator, EBodyRegion Re
 
 void UBallInteractionComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+	if (CVarFootballDebugBall.GetValueOnGameThread() != 0) {
+		if (const UPrimitiveComponent* Body = Cast<UPrimitiveComponent>(GetOwner()->GetRootComponent())) {
+			const FVector Center = GetOwner()->GetActorLocation();
+			const FVector Velocity = Body->GetPhysicsLinearVelocity();
+			const FVector Spin = Body->GetPhysicsAngularVelocityInDegrees();
+			DrawDebugDirectionalArrow(GetWorld(), Center, Center + Velocity * 0.05, 6.f, FColor::Yellow);
+			DrawDebugLine(GetWorld(), Center, Center + Spin * 0.02, FColor::Magenta, false, -1.f, 0, 1.f);
+			DrawDebugString(GetWorld(), Center + FVector(0.0, 0.0, 25.0), FString::Printf(TEXT("%s  %.0f cm/s  %.1f rev/s"),
+				BallState ? *UEnum::GetDisplayValueAsText(BallState->GetState()).ToString() : TEXT("-"), Velocity.Size(), Spin.Size() / 360.0),
+				nullptr, FColor::White, 0.f);
+		}
+	}
 	if (CVarFootballDebugRegions.GetValueOnGameThread() == 0) {
 		return;
 	}

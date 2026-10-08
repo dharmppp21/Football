@@ -4,9 +4,12 @@
 #include "Engine/DataTable.h"
 #include "FootballTypes.generated.h"
 
+class AActor;
+
 // Which movement model the ball is in (doc §12). Who owns the ball is tracked separately (doc §30).
+// GoalkeeperControlled (spec §4, §128): a goalkeeper has captured the ball; reached only through Receiving.
 UENUM(BlueprintType)
-enum class EBallState : uint8 { Free, Controlled, SkillControlled, Passing, Shooting, Receiving, Deflected, Airborne };
+enum class EBallState : uint8 { Free, Controlled, SkillControlled, Passing, Shooting, Receiving, Deflected, Airborne, GoalkeeperControlled };
 
 UENUM(BlueprintType)
 enum class EBallOwnerType : uint8 { None, Player, Opponent, Goalkeeper };
@@ -45,9 +48,11 @@ enum class EBodyRegion : uint8 {
 	LeftSole, RightSole, LeftHand, RightHand
 };
 
-// Contact priority (doc §31): a higher one wins the ball for the frame, and a lower one never overrides it.
+// Contact priority (doc §31) and response authority (spec §145): a higher one wins the ball for the frame, and a lower
+// one never overrides it. §145's order: Capture > Strike / SkillContact (Skill) > Receive > ControlledDribble (Dribble)
+// > Deflection (Foot, Body) > EnvironmentPhysics (Environment). Saved by name, so the values may move.
 UENUM(BlueprintType)
-enum class EContactPriority : uint8 { None = 0, Environment = 1, Body = 2, Foot = 3, Dribble = 4, Skill = 5 };
+enum class EContactPriority : uint8 { None = 0, Environment = 1, Body = 2, Foot = 3, Dribble = 4, Receive = 5, Skill = 6, Capture = 7 };
 
 // Result of the contact checks (doc §7). Anything but Valid names the first test that failed.
 UENUM(BlueprintType)
@@ -266,6 +271,8 @@ struct FBodyRegionRow : public FTableRowBase {
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Region") FVector LocalNormal = FVector(1.f, 0.f, 0.f);
 	// Size of the surface patch (debug drawing, nearest-region search).
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Region") float Radius = 5.f;
+	// What the surface is (spec §10), e.g. Boot, Shin, Torso, Head, Hand - a label for responses and effects.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Region") FName SurfaceType;
 	// Deflection response of this surface (doc §19): bounce of the normal part, loss of the sliding part,
 	// share of the sliding speed turned into spin.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Deflection") float Restitution = 0.5f;
@@ -298,6 +305,102 @@ struct FContactTracker {
 	UPROPERTY(BlueprintReadOnly, Category = "Contact") float SeparatedFor = 0.f;
 	UPROPERTY(BlueprintReadOnly, Category = "Contact") int32 Recontacts = 0;
 	UPROPERTY(BlueprintReadOnly, Category = "Contact") float ImpulseUsed = 0.f;
+};
+
+// Input of UBallPhysicsResponse::ComputeResponse (spec §7, §91, §122): the ball, the body surface it meets and that
+// surface's response parameters. Velocities in cm/s, spin in rad/s, mass in kg.
+USTRUCT(BlueprintType)
+struct FBallResponseInput {
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") EBallResponseMode Mode = EBallResponseMode::PhysicalTouch;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") FVector BallCenter = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") FVector BallVelocity = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") FVector BallAngularVelocity = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") float BallRadius = 11.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") float BallMass = 0.43f;
+	// Moment of inertia = InertiaFactor * mass * radius^2: 0.667 = a thin shell, the real ball, which BP_Football's body has
+	// matched since master plan U.2 (inertia scale 1.667 on the solid sphere's 0.4).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") float InertiaFactor = 0.667f;
+	// Where the body touches the ball, the normal from the body toward the ball, and the body's velocity there.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") FVector ContactPoint = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") FVector ContactNormal = FVector::ForwardVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") FVector BodyVelocity = FVector::ZeroVector;
+	// Share of the approach speed (along the normal) given back.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") float Restitution = 0.5f;
+	// Coulomb friction: the sideways impulse is at most Friction x the normal impulse (else the surface grips fully).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") float Friction = 0.5f;
+	// Effective contact strength: the body region's effective mass M as M / (M + ball mass); 1 = an immovable body.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") float ContactStrength = 1.f;
+};
+
+// Output of UBallPhysicsResponse::ComputeResponse: the raw physical impulse, before any assist (spec §14 adds that).
+USTRUCT(BlueprintType)
+struct FBallResponse {
+	GENERATED_BODY()
+
+	// False when the ball is not closing on the body (no impulse), or for ControlledContact / Capture (not impulses).
+	UPROPERTY(BlueprintReadOnly, Category = "Response") bool bContact = false;
+	// Applied at the contact point (kg*cm/s); AngularImpulse = (contact point - centre) x LinearImpulse (spec §91).
+	UPROPERTY(BlueprintReadOnly, Category = "Response") FVector LinearImpulse = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Response") FVector AngularImpulse = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Response") FVector VelocityAfter = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Response") FVector AngularVelocityAfter = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Response") float NormalImpulse = 0.f;
+	UPROPERTY(BlueprintReadOnly, Category = "Response") FVector TangentImpulse = FVector::ZeroVector;
+	// The friction cap was reached: the ball slides on the surface instead of gripping.
+	UPROPERTY(BlueprintReadOnly, Category = "Response") bool bSliding = false;
+};
+
+// One requested change to the ball (spec §146). Systems hand these to UBallInteractionComponent::SubmitResponse; once
+// per frame, just before physics, the highest Priority wins (§145, §147) and the rest are dropped and logged.
+USTRUCT(BlueprintType)
+struct FBallResponseCommand {
+	GENERATED_BODY()
+
+	// Who asks (a debug name such as Dribble, Kick, Skill, Deflection) and the actor behind it.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") FName Source;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") TObjectPtr<AActor> Instigator = nullptr;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") EBallResponseMode ResponseType = EBallResponseMode::PhysicalTouch;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") EContactPriority Priority = EContactPriority::Body;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") FVector ContactPoint = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") FVector ContactNormal = FVector::ZeroVector;
+	// An impulse (kg*cm/s), or with bVelocityChange a velocity change (cm/s). At ContactPoint with bImpulseAtContactPoint
+	// (the engine then adds the spin from the offset), else at the centre.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") FVector LinearImpulse = FVector::ZeroVector;
+	// An angular impulse in radians, or with bVelocityChange an angular velocity change (rad/s).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") FVector AngularImpulse = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") bool bVelocityChange = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") bool bImpulseAtContactPoint = false;
+	// Bounded velocity support (the dribble, §6): after the impulses the velocity moves toward DesiredVelocity by at most
+	// MaxAllowedCorrection (cm/s; 0 or less = all the way).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") bool bUseDesiredVelocity = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") FVector DesiredVelocity = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") float MaxAllowedCorrection = 0.f;
+	// A spin set outright (deg/s): the legacy skill touch, until master plan Phase 6.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") bool bSetAngularVelocity = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") FVector AngularVelocityDeg = FVector::ZeroVector;
+	// The state and owner after the response (§146); bSetStateAfter off leaves the state alone.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") bool bSetStateAfter = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") EBallState BallStateAfter = EBallState::Free;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") TObjectPtr<AActor> OwnerAfter = nullptr;
+};
+
+// One arbitrated command (debug and tests): applied, or dropped and why.
+USTRUCT(BlueprintType)
+struct FBallCommandRecord {
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Response") float Time = 0.f;
+	UPROPERTY(BlueprintReadOnly, Category = "Response") FName Source;
+	UPROPERTY(BlueprintReadOnly, Category = "Response") FString Instigator;
+	UPROPERTY(BlueprintReadOnly, Category = "Response") EBallResponseMode ResponseType = EBallResponseMode::PhysicalTouch;
+	UPROPERTY(BlueprintReadOnly, Category = "Response") EContactPriority Priority = EContactPriority::None;
+	UPROPERTY(BlueprintReadOnly, Category = "Response") bool bApplied = false;
+	UPROPERTY(BlueprintReadOnly, Category = "Response") FString Note;
+	UPROPERTY(BlueprintReadOnly, Category = "Response") FVector LinearImpulse = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Response") FVector DesiredVelocity = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Response") FVector VelocityBefore = FVector::ZeroVector;
 };
 
 // The last body contact the ball handled (debug and tests).

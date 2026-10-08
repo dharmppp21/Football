@@ -62,11 +62,12 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Skill|Approach")
 	float MinApproachTime = 0.1f;
 
-	// How fast a free rolling ball slows down (1/s): v(t) = v0 e^(-k t). Used to aim a touch so the ball rolls to the next
-	// one. Measured on BP_Football on 2026-10-05: ~0.65 from 100 to 480 cm/s (its angular damping and contacts, more than
-	// its linear damping). Re-measure if the ball's physics changes.
+	// How fast a free rolling ball slows down (1/s), as the model v(t) = v0 e^(-k t) used to aim a touch so the ball rolls to
+	// the next one. Since master plan U.3 the ball rolls and slows almost evenly (~0.83 m/s^2 at these speeds), so this is a
+	// fit to the Elastico's touch-to-touch roll (~50 cm in 0.73 s): 1.07 brings contact 1 back to 1-2 cm. Until U.3 it
+	// was 0.64, set mostly by the old angular damping (1.5). Re-measure if the ball's physics changes.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Skill|Touch")
-	float BallRollDecay = 0.64f;
+	float BallRollDecay = 1.07f;
 
 	// How long the recorder keeps going after a skill ends (the hand-back to the dribble).
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Skill|Debug")
