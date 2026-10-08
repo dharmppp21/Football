@@ -27,10 +27,11 @@ import unreal
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(unreal.Paths.project_saved_dir(), 'Regress')
 RATES = {30: 30.0, 60: 59.9988, 120: 120.0}  # 59.9988 = the two physics substeps baseline60 was recorded with
-# Recorded 2026-10-07 after master plan 3.1 (Magnus only airborne, no ground-spin rule) with run('p3baseNN', ..., NN).
-# Until then: baselineNN, phase1kick_NN, phase1defl_NN, phase1post_NN.
-BASELINES = {'parity': 'p3base{fps}_parity{fps}', 'kicks': 'p3base{fps}_kicks{fps}', 'deflections': 'p3base{fps}_deflections{fps}',
-             'skills': 'p3base{fps}_skills{fps}'}
+# Recorded 2026-10-08 after master plan U5 (knuckle removed, grass spin friction, kicks set their topspin / backspin,
+# the shoot's backspin, restitution 0.66 for the FIFA rebound test) with run('ubase2NN', ..., NN). Before: ubaseNN (U1-U4),
+# p3baseNN (after 3.1), baselineNN, phase1kick_NN, phase1defl_NN, phase1post_NN.
+BASELINES = {'parity': 'ubase2{fps}_parity{fps}', 'kicks': 'ubase2{fps}_kicks{fps}', 'deflections': 'ubase2{fps}_deflections{fps}',
+             'skills': 'ubase2{fps}_skills{fps}'}
 ALL = ['selftest', 'parity', 'kicks', 'deflections', 'skills', 'reset']
 QUICK = ['parity', 'reset']
 TOL = dict(recorded=0.05, deflection=0.5,  # cm; cm/s of formula error
@@ -216,7 +217,12 @@ def _tick(delta):
             raise RuntimeError('PIE stopped')
         if s['phase'] == 'settle':
             if unreal.GameplayStatics.get_time_seconds(world) >= s['until']:
-                s['phase'] = 'next'
+                _submit_pair(world)
+                s['phase'] = 'arbitrate'
+            return
+        if s['phase'] == 'arbitrate':
+            s['results']['arbitration'] = _read_pair(world)
+            s['phase'] = 'next'
             return
         suite = s['pie_suites'][s['index']]
         mod_name, start, compare = SUITES[suite]
@@ -244,6 +250,26 @@ def _tick(delta):
     except Exception as e:  # never leave a broken callback, a fixed frame rate or PIE running
         import traceback
         _end('error: %r %s' % (e, traceback.format_exc()[-300:]))
+
+
+def _interaction(world):
+    return _state['mods']['ball_parity_test']._actors(world)[0].get_component_by_class(unreal.BallInteractionComponent)
+
+
+def _submit_pair(world):
+    """Plan 3.4: two commands in one frame (neither moves the ball). The next frame's log must show the higher one applied
+    and the lower one dropped."""
+    for name, priority in (('CheckLow', unreal.ContactPriority.BODY), ('CheckHigh', unreal.ContactPriority.SKILL)):
+        c = unreal.BallResponseCommand()
+        c.source = unreal.Name(name)
+        c.priority = priority
+        _interaction(world).submit_response(c)
+
+
+def _read_pair(world):
+    log = {str(r.source): r for r in _interaction(world).get_command_log() if str(r.source) in ('CheckLow', 'CheckHigh')}
+    return dict(passed=len(log) == 2 and log['CheckHigh'].applied and not log['CheckLow'].applied,
+                low=str(log['CheckLow'].note) if 'CheckLow' in log else None)
 
 
 def _end(result):

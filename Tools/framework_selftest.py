@@ -185,6 +185,85 @@ def run():
     t = tracker(R.update_contact_state, t, 0.5, dt, hold)
     check('100 continuous stops off the ball', not R.can_process_contact(t, hold))
 
+    # Master plan Phase 3: the raw physical response (§7, §91, §122), the response authority (§145, §147), the states (§4, §128).
+    M, BRM = 0.43, unreal.BallResponseMode
+
+    def respond(v, w=V(0, 0, 0), body=V(0, 0, 0), e=0.5, mu=0.5, s=1.0, mode=BRM.PHYSICAL_TOUCH):
+        i = unreal.BallResponseInput()  # body on the ball's -X side, its normal +X
+        for k, val in dict(mode=mode, ball_velocity=v, ball_angular_velocity=w, contact_point=V(-11, 0, 0), contact_normal=V(1, 0, 0),
+                           body_velocity=body, restitution=e, friction=mu, contact_strength=s).items():
+            i.set_editor_property(k, val)
+        return unreal.BallPhysicsResponse.compute_response(i)
+
+    r = respond(V(-500, 0, 0))
+    check('122 head-on bounce', r.contact and near(r.velocity_after, V(250, 0, 0)) and abs(r.normal_impulse - 750 * M) < 0.01, str(r.velocity_after))
+    r = respond(V(-500, 400, 0), mu=0.3)  # the shell needs 160 M of grip; mu 0.3 x the 750 M normal impulse allows 225 M
+    slip = r.velocity_after + r.angular_velocity_after.cross(V(-11, 0, 0))
+    k = unreal.BallResponseInput().get_editor_property('inertia_factor')  # 0.667, a thin shell (master plan U.2)
+    check('122 grip stops the slip', not r.sliding and abs(slip.y) < 0.01 and abs(r.velocity_after.y - 400.0 / (1.0 + k)) < 0.01, str(r.velocity_after))
+    r = respond(V(-500, 400, 0), mu=0.05)
+    check('122 friction cap slides', r.sliding and abs(r.velocity_after.y - (400 - 0.05 * 750)) < 0.01, str(r.velocity_after))
+    r = respond(V(0, 0, 0), body=V(1000, 300, 0))
+    check('91 spin from the offset', r.contact and r.angular_velocity_after.z < -1.0
+          and near(r.angular_impulse, V(-11, 0, 0).cross(r.linear_impulse), 0.001), str(r.angular_velocity_after))
+    check('122 separating: no impulse', not respond(V(500, 0, 0)).contact)
+    check('122 half strength, half impulse', abs(respond(V(-500, 0, 0), s=0.5).normal_impulse - 375 * M) < 0.01)
+    check('127 / 128 not impulses', not respond(V(-500, 0, 0), mode=BRM.CONTROLLED_CONTACT).contact and not respond(V(-500, 0, 0), mode=BRM.CAPTURE).contact)
+    import random
+    rnd, worst = random.Random(7), 0.0
+
+    def energy(v, w):
+        return 0.5 * M * v.length() ** 2 + 0.5 * k * M * 121.0 * w.length() ** 2
+    for _ in range(200):
+        v = V(-rnd.uniform(10, 3000), rnd.uniform(-1500, 1500), rnd.uniform(-500, 500))
+        w = V(rnd.uniform(-60, 60), rnd.uniform(-60, 60), rnd.uniform(-60, 60))
+        r = respond(v, w, e=rnd.uniform(0, 0.3), mu=rnd.uniform(0, 1), mode=BRM.ENERGY_ABSORPTION)
+        worst = max(worst, energy(r.velocity_after, r.angular_velocity_after) - energy(v, w))
+    check('126 absorption never adds energy', worst <= 0.5, str(worst))
+
+    P = unreal.ContactPriority
+    order = [P.ENVIRONMENT, P.BODY, P.FOOT, P.DRIBBLE, P.RECEIVE, P.SKILL, P.CAPTURE]
+    check('145 authority order', [p.value for p in order] == sorted(set(p.value for p in order)))
+
+    def command(source, priority):
+        c = unreal.BallResponseCommand()
+        c.set_editor_property('source', source)
+        c.set_editor_property('priority', priority)
+        return c
+    pick = unreal.BallInteractionComponent.pick_winning_command
+    # On a tie the later command wins: it was worked out from the earlier one's result (master plan 3.5).
+    check('147 the strike beats the dribble, the later of a tie wins', pick([command('Dribble', P.DRIBBLE), command('Kick', P.SKILL),
+                                                                            command('Body', P.BODY), command('Skill', P.SKILL)]) == 3)
+    check('147 nothing queued', pick([]) == -1)
+    S, B = unreal.BallStateComponent, unreal.BallState
+    check('128 caught only through Receiving', S.is_transition_allowed(B.RECEIVING, B.GOALKEEPER_CONTROLLED)
+          and not S.is_transition_allowed(B.FREE, B.GOALKEEPER_CONTROLLED))
+    check('4 a keeper\'s ball', not S.is_transition_allowed(B.GOALKEEPER_CONTROLLED, B.CONTROLLED)
+          and not S.is_transition_allowed(B.GOALKEEPER_CONTROLLED, B.RECEIVING) and S.is_transition_allowed(B.GOALKEEPER_CONTROLLED, B.PASSING))
+
+    # Master plan U1 / U2: the ball's air forces (UBallMovementComponent::ComputeAeroForce). U4 (knuckle) was removed.
+    ball = unreal.get_default_object(unreal.BallMovementComponent)
+    q = 2.28e-4  # 1/2 rho A, kg/cm
+
+    def cd_at(speed, sp=0.0, airborne=True):  # sp: spin across the travel, r w / v
+        return -ball.compute_aero_force(V(speed, 0, 0), V(0, 0, sp * speed / 11.0 * 57.29578), airborne).x / (q * speed * speed)
+    check('U1 drag below the crisis (8 m/s)', abs(cd_at(800.0) - 0.4477) < 0.002, str(cd_at(800.0)))
+    check('U1 drag above the crisis (25 m/s)', abs(cd_at(2500.0) - 0.187) < 0.002, str(cd_at(2500.0)))
+    check('U1 the crisis between 11 and 15 m/s', cd_at(1100.0) > 0.4 and cd_at(1500.0) < 0.25)
+    check('U1 spin adds drag in the air, up to Sp 0.4', abs(cd_at(2500.0, 0.2) - 0.287) < 0.002 and abs(cd_at(2500.0, 1.0) - 0.387) < 0.002)
+    check('U1 no spin drag on the ground (a rolling ball has Sp 1)', abs(cd_at(2500.0, 1.0, False) - 0.187) < 0.002)
+
+    def lift_at(sp, airborne=True):
+        f = ball.compute_aero_force(V(2500, 0, 0), V(0, 0, sp * 2500.0 / 11.0 * 57.29578), airborne)
+        return f.y / (q * 2500.0 ** 2), f
+    cl, f = lift_at(0.1)
+    check('U2 Magnus at Sp 0.1, toward spin x velocity', abs(cl - 0.32 * (1 - 2.71828 ** (-0.1 / 0.13))) < 0.002 and abs(f.z) < 1e-6, str(cl))
+    check('U2 Magnus levels off', abs(lift_at(0.3)[0] - 0.288) < 0.002 and abs(lift_at(1.0)[0] - 0.32) < 0.002)
+    check('U2 no Magnus on the ground', abs(lift_at(0.3, False)[1].y) < 1e-6)
+    check('U2 rifle spin lifts nothing', abs(ball.compute_aero_force(V(2500, 0, 0), V(3000, 0, 0), True).y) < 1e-6)
+    check('U4 removed: a spinless fast ball feels only drag', abs(ball.compute_aero_force(V(2500, 0, 0), V(0, 0, 0), True).y) < 1e-6
+          and not hasattr(ball, 'compute_knuckle_force'))
+
     # Region table vs the enum and the mesh.
     table = unreal.load_asset(TABLE)
     mesh = unreal.load_asset(MESH)

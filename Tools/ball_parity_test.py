@@ -31,6 +31,13 @@ SCENARIOS = [
          power=2200.0, lift=0.03, spin_right=0.0, spin_top=-520.0, duration=2.0),
     dict(name='dribble_40', kind='dribble', offset=(0.0, 40.0, 0.0), duration=2.0),
     dict(name='dribble_120', kind='dribble', offset=(0.0, 120.0, 0.0), duration=2.0),
+    # The FIFA ball-roll test (master plan U.3): released rolling at 3.4 m/s - the speed a hollow ball has on the turf after
+    # the 1 m drop down the 45 deg two-rail ramp. FIFA Quality Pro pitches stop it after 4-8 m; we aim at 6 m.
+    dict(name='ball_roll', kind='roll', spot=(3270.0, 0.0, 11.0), speed=340.0, duration=6.0),
+    # Master plan U5: a ball spinning 10 rev/s on the spot must stop (the grass's torsional friction), and the FIFA ball
+    # rebound test - dropped from 2 m (its bottom) onto natural turf it must come back up 0.6-1.0 m (FIFA Quality Pro).
+    dict(name='spin_stop', kind='roll', spot=(3270.0, 0.0, 11.0), speed=0.0, spin=(0.0, 0.0, 3600.0), duration=3.0),
+    dict(name='ball_drop', kind='drop', spot=(3270.0, 0.0, 211.0), duration=2.5),
 ]
 SETTLE = 0.3  # seconds between the reset and the start of a scenario
 
@@ -50,13 +57,20 @@ GRAVITY = 980.0
 # straight at the goal centre (on target, so the aim assist leaves the direction alone). The Blueprint's own formula:
 # power = Base * Lerp(Floor, 1, Charge^Exp), finesse spin = SpinRight * the same Lerp (node references in
 # Audit_Phase1.txt). Phases 9/10 compare the new strikes against these.
-BP_KICKS = {  # name: (base power, floor, exponent, lift, spin right per lerp, spin top)
-    'shoot': (3600.0, 0.20, 1.25, 0.26, 0.0, 0.0),
-    'pass': (2200.0, 0.20, 1.10, 0.03, 0.0, -520.0),
-    'through': (2600.0, 0.20, 1.20, 0.08, 0.0, 0.0),
-    'finesse_r': (3300.0, 0.22, 1.35, 0.30, 360.0, 0.0),
-    'finesse_l': (3300.0, 0.22, 1.35, 0.30, -360.0, 0.0),
-    'lob': (2500.0, 0.19, 1.15, 0.75, 0.0, 0.0),
+# Recalibrated 2026-10-08 (master plan U.4) for the real ball physics, to the tuned goal-line results: Tools/kick_fit.py
+# fitted shoot / finesse / lob (heights, finesse curl), a PIE sweep pass / through (arrival times at 75 / 100%). The pass
+# and through topspin now scale with the charge (a soft pass would otherwise land overspun and speed up); the lob got
+# 4 rev/s backspin and the through ball topspin. U5 (2026-10-08, the user: "remove the knuckle ... I want real ball shoot
+# feel"): the shoot is an instep drive with backspin, 205 x the charge factor (Sp ~0.10: 4.3 rev/s at 75%), launched lower
+# (lift 0.159) so the backspin carries it. Before: shoot 3600 / 0.26 no spin, pass 2200 exp 1.10, through 2600 exp 1.20 no
+# spin, finesse 3300 / 0.30 / 360, lob 2500 / 0.75 no spin.
+BP_KICKS = {  # name: (base power, floor, exponent, lift, spin right per lerp, spin top, spin top scales with the lerp)
+    'shoot': (3768.0, 0.20, 1.25, 0.159, 0.0, 205.0, True),
+    'pass': (2397.0, 0.20, 1.172, 0.03, 0.0, -520.0, True),
+    'through': (3104.0, 0.20, 1.290, 0.08, 0.0, -520.0, True),
+    'finesse_r': (3571.0, 0.22, 1.35, 0.301, 425.0, 0.0, False),
+    'finesse_l': (3571.0, 0.22, 1.35, 0.301, -425.0, 0.0, False),
+    'lob': (2588.0, 0.19, 1.15, 0.601, 0.0, 144.0, False),
 }
 GOAL_LINE_X = 5270.0
 KICK_SPOT = (GOAL_LINE_X - 2000.0, 0.0, 11.0)
@@ -64,15 +78,20 @@ KICK_SPOT = (GOAL_LINE_X - 2000.0, 0.0, 11.0)
 
 def kick_baseline_scenarios(charges=(0.4, 0.75, 1.0), duration=3.0):
     out = []
-    for name, (base, floor, exp, lift, spin_right, spin_top) in BP_KICKS.items():
+    for name, (base, floor, exp, lift, spin_right, spin_top, top_scales) in BP_KICKS.items():
         for charge in charges:
             k = floor + (1.0 - floor) * charge ** exp
             out.append(dict(name='%s_%d' % (name, round(charge * 100)), kind='kick', spot=KICK_SPOT, dir=(1.0, 0.0, 0.0),
-                            power=base * k, lift=lift, spin_right=spin_right * k, spin_top=spin_top, duration=duration, charge=charge))
+                            power=base * k, lift=lift, spin_right=spin_right * k, spin_top=spin_top * (k if top_scales else 1.0),
+                            duration=duration, charge=charge))
     return out
 
 
 KICK_SCENARIOS = kick_baseline_scenarios()
+# Master plan U5: the 75% shoot off a ball already rolling 3 m/s forward (as off a dribble): it must leave with the strike's
+# own spin, not the roll's topspin added to it.
+KICK_SCENARIOS.append(dict(next(s for s in KICK_SCENARIOS if s['name'] == 'shoot_75'), name='shoot_75_rolling',
+                           pre_velocity=(300.0, 0.0, 0.0), pre_spin=(0.0, 300.0 / 11.0 * 57.29578, 0.0)))
 
 _state = {}
 
@@ -137,7 +156,7 @@ def _tick(delta):
         step = s['step']
         if step == 0:  # reset
             _place_player(player)
-            if sc['kind'] == 'kick':
+            if sc['kind'] in ('kick', 'roll', 'drop'):
                 player.set_actor_tick_enabled(False)
                 _reset_ball(ball, sc['spot'])
             elif sc['kind'] == 'throw':
@@ -166,8 +185,27 @@ def _tick(delta):
             movement.start_recording(sc['duration'])
             s['rec_world_start'] = now
             if sc['kind'] == 'kick':
+                if 'pre_velocity' in sc:  # kicked while already moving (as off a dribble)
+                    ball.root_component.set_physics_linear_velocity(unreal.Vector(*sc['pre_velocity']))
+                    ball.root_component.set_physics_angular_velocity_in_degrees(unreal.Vector(*sc['pre_spin']))
                 # ApplyKick(KickDirection, Power, Lift, SpinRight, Kicker, SpinTop) - Kicker comes before SpinTop.
                 ball.call_method('ApplyKick', (unreal.Vector(*sc['dir']), sc['power'], sc['lift'], sc['spin_right'], None, sc['spin_top']))
+            elif sc['kind'] == 'drop':
+                # Released at rest from the spot (its fall during SETTLE undone): teleport back, no velocity, no spin.
+                ball.set_actor_location(unreal.Vector(*sc['spot']), False, True)
+                ball.root_component.set_physics_linear_velocity(unreal.Vector(0, 0, 0))
+                ball.root_component.set_physics_angular_velocity_in_degrees(unreal.Vector(0, 0, 0))
+            elif sc['kind'] == 'roll':
+                # Calibration runs try several BallMovement settings in one session. Plain attribute sets: set_editor_property
+                # would rerun the ball's construction script in PIE and swap in a fresh component (an empty recorder).
+                for key, value in sc.get('movement', {}).items():
+                    setattr(movement, key, value)
+                body = ball.root_component
+                s['body'] = dict(linear_damping=body.get_linear_damping(), angular_damping=body.get_angular_damping(),
+                                 inertia=list(body.get_inertia_tensor().to_tuple()), mass=body.get_mass())
+                ball.root_component.set_physics_linear_velocity(unreal.Vector(sc['speed'], 0, 0))
+                spin = sc.get('spin', (0.0, sc['speed'] / 11.0 * 57.29578, 0.0))  # rolling, unless the scenario gives a spin
+                ball.root_component.set_physics_angular_velocity_in_degrees(unreal.Vector(*spin))
             elif sc['kind'] == 'throw':
                 s['contacts'] = []
                 # Aim from where the ball actually is now (it falls a little during SETTLE).
@@ -194,7 +232,7 @@ def _tick(delta):
             contact = next((c for c in contacts if c['applied']), contacts[0] if contacts else None)
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(dict(scenario=sc, guide=s.get('guide'), target=s.get('target'), start=s.get('start'), contact=contact,
-                               contacts=contacts, record_start=s.get('rec_world_start'),
+                               contacts=contacts, record_start=s.get('rec_world_start'), body=s.get('body') if sc['kind'] == 'roll' else None,
                                extras=movement.get_editor_property('apply_physics_extras'), samples=rec), f)
             s['done'].append(os.path.basename(path))
             s['index'] += 1
@@ -277,12 +315,65 @@ def metrics(path):
                 for axis, v in zip('xyz', p):
                     out['%s@%.2f' % (axis, t)] = v
         out['apex_z'] = max(r['p'][2] for r in s)
+    elif sc['kind'] == 'roll':
+        for t in (0.5, 1.0, 2.0, 3.0):
+            p, _ = _at(s, t)
+            if p:
+                out['x@%.2f' % t] = p[0]
+        out['roll_cm'] = roll_distance(s)
+        if sc.get('spin'):  # how long a spin on the spot lasts (below 10 deg/s)
+            out['spin_stop_s'] = next((r['t'] for r in s[1:] if abs(r['w'][2]) < 10.0), s[-1]['t'])
+    elif sc['kind'] == 'drop':
+        out['rebound_cm'] = rebound_height(s)
     else:
         g = d['guide']
         for t in DRIBBLE_TIMES:
             p, _ = _at(s, t)
             if p:
                 out['dist@%.2f' % t] = ((p[0] - g[0]) ** 2 + (p[1] - g[1]) ** 2) ** 0.5
+    return out
+
+
+def rebound_height(samples, radius=11.0):
+    """FIFA ball rebound: how high the ball's bottom comes back up after its first bounce (cm). The bounce is the first
+    turn from falling to rising near the ground (the recording starts before the drop's teleport, which also 'rises')."""
+    k = next((i for i in range(1, len(samples)) if samples[i - 1]['v'][2] < 0.0 <= samples[i]['v'][2]
+              and samples[i]['p'][2] < radius + 30.0), None)
+    if k is None:
+        return 0.0
+    rise = []
+    for r in samples[k:]:
+        if rise and r['v'][2] < 0.0 and r['p'][2] < rise[-1]:
+            break
+        rise.append(r['p'][2])
+    return max(rise) - radius
+
+
+def roll_distance(samples):
+    """How far a rolled ball got along the ground before it stopped (below 2 cm/s), or by the end of the recording. A jump
+    of more than 50 cm in one sample is a respawn (a goal / out-of-bounds reset): the roll ends at the sample before it."""
+    stop = samples[-1]
+    for a, b in zip(samples[1:], samples[2:]):
+        if ((b['p'][0] - a['p'][0]) ** 2 + (b['p'][1] - a['p'][1]) ** 2) ** 0.5 > 50.0:
+            stop = a
+            break
+        if (b['v'][0] ** 2 + b['v'][1] ** 2) ** 0.5 < 2.0:
+            stop = b
+            break
+    p0 = samples[0]['p']
+    return ((stop['p'][0] - p0[0]) ** 2 + (stop['p'][1] - p0[1]) ** 2) ** 0.5
+
+
+def roll_report(label, scenarios, run=1):
+    """Per roll scenario: rolling resistance tried, distance (cm), time to stop and the mean deceleration (m/s^2)."""
+    out = {}
+    for sc in scenarios:
+        with open(os.path.join(OUT_DIR, '%s_r%d_%s.json' % (label, run, sc['name'])), encoding='utf-8') as f:
+            s = json.load(f)['samples']
+        stop = next((r for r in s[1:] if (r['v'][0] ** 2 + r['v'][1] ** 2) ** 0.5 < 2.0), None)
+        d = roll_distance(s)
+        out[sc['name']] = dict(movement=sc.get('movement'), roll_cm=round(d, 1), stop_s=stop and round(stop['t'], 2),
+                               decel=round(sc['speed'] ** 2 / (2.0 * d) / 100.0, 3) if d > 0 else None)
     return out
 
 
