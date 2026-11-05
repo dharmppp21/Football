@@ -264,6 +264,382 @@ def run():
     check('U4 removed: a spinless fast ball feels only drag', abs(ball.compute_aero_force(V(2500, 0, 0), V(0, 0, 0), True).y) < 1e-6
           and not hasattr(ball, 'compute_knuckle_force'))
 
+    # Master plan Phase 4: bounded assistance (UBallAssist, spec §14, §70, §105) and the player attributes (§62).
+    import math
+    A = unreal.BallAssist
+
+    def assist(raw, want, speed=0.0, s=0.15, ang=10.0, dv=100.0, arcade=False):
+        i = unreal.BallAssistInput()
+        for k, val in dict(raw_velocity=raw, intended_direction=want, intended_speed=speed, strength=s, max_angle_degrees=ang,
+                           max_speed_change=dv, arcade=arcade).items():
+            i.set_editor_property(k, val)
+        return A.bounded_blend(i), i
+
+    def angle(a, b):
+        la, lb = a.length(), b.length()
+        return 0.0 if la < 1e-6 or lb < 1e-6 else math.degrees(math.acos(max(-1.0, min(1.0, a.dot(b) / (la * lb)))))
+    r, _ = assist(V(1000, 0, 0), V(0, 1, 0), 1500.0, s=0.0)
+    check('§14 strength 0 = the raw result', near(r.velocity, V(1000, 0, 0), 1e-3) and r.velocity_change.length() < 1e-3)
+    r, _ = assist(V(1000, 0, 0), V(0, 1, 0), s=1.0, ang=90.0)
+    check('§14 capped at 0.40 without the arcade flag', abs(r.strength_used - 0.4) < 1e-6 and r.strength_capped)
+    r, _ = assist(V(1000, 0, 0), V(0, 1, 0), s=1.0, ang=90.0, arcade=True)
+    check('§14 an arcade action may go to 1.0', abs(r.strength_used - 1.0) < 1e-6 and angle(r.velocity, V(0, 1, 0)) < 0.01)
+    rnd, bad = random.Random(11), []
+    for n in range(300):
+        raw = V(rnd.uniform(-3000, 3000), rnd.uniform(-3000, 3000), rnd.uniform(-800, 800))
+        want = V(rnd.uniform(-1, 1), rnd.uniform(-1, 1), rnd.uniform(-0.3, 0.3))
+        speed, ang, dv = rnd.choice((0.0, rnd.uniform(0, 4000))), rnd.uniform(0, 45), rnd.uniform(0, 400)
+        prev = None
+        for s in (0.0, 0.1, 0.25, 0.4):
+            r, _ = assist(raw, want, speed, s, ang, dv)
+            err0 = angle(raw, want)
+            if r.angle_correction_degrees > ang + 1e-3 or r.angle_correction_degrees > err0 * s + 1e-3 \
+                    or abs(r.velocity.length() - raw.length()) > dv + 1e-2 or angle(r.velocity, raw) > ang + 1e-2:
+                bad.append(('bounds', n, s))
+            if prev is not None and angle(r.velocity, want) > angle(prev.velocity, want) + 1e-3:
+                bad.append(('monotonic', n, s))
+            prev = r
+    check('§14 / §70 bounds never exceeded, more strength never moves away from the intent (300 random)', not bad, str(bad[:3]))
+    _, base = assist(V(1000, 0, 0), V(0, 1, 0), s=0.2, ang=10.0, dv=100.0)
+    check('§105 no curve = x1', abs(A.scale_for_skill(base, 99.0, None).strength - 0.2) < 1e-6)
+    curve = unreal.load_asset('/Game/Football/Data/C_PlayerSkillToAssist')  # 0 -> 0.5, 100 -> 1.5, linear
+    check('§105 C_PlayerSkillToAssist exists', curve is not None)
+    if curve:
+        sc = A.scale_for_skill(base, 75.0, curve)
+        check('§105 / §62 skill scales strength and bounds only', abs(sc.strength - 0.25) < 1e-4 and abs(sc.max_angle_degrees - 12.5) < 1e-3
+              and abs(sc.max_speed_change - 125.0) < 1e-3 and near(sc.raw_velocity, base.raw_velocity, 1e-6), str((sc.strength, sc.max_angle_degrees)))
+        hi = A.scale_for_skill(assist(V(1000, 0, 0), V(0, 1, 0), s=0.35)[1], 100.0, curve)
+        check('§14 the 0.40 cap holds after a skill boost', abs(A.bounded_blend(hi).strength_used - 0.4) < 1e-6)
+    da = unreal.load_asset('/Game/Football/Data/DA_PlayerAttributes_Default')
+    check('§62 DA_PlayerAttributes_Default exists and uses C_PlayerSkillToAssist', da is not None
+          and da.get_editor_property('skill_to_assist_scale') == curve)
+    if da:
+        attrs = da.get_editor_property('attributes')
+        names = ['ball_control', 'dribbling', 'agility', 'balance', 'acceleration', 'sprint_speed', 'passing', 'long_passing', 'crossing',
+                 'shot_power', 'finishing', 'curve', 'volleys', 'heading', 'reactions', 'composure', 'weak_foot', 'skill_moves',
+                 'goalkeeper_handling', 'goalkeeper_diving', 'goalkeeper_reflexes', 'goalkeeper_kicking']
+        check('§62 the 22 attributes, 0-100', all(0.0 <= attrs.get_editor_property(n) <= 100.0 for n in names))
+        c = da.get_editor_property('skill_to_assist_scale')
+        if c:
+            check('§105 PlayerSkill -> assist rises (0.5 at 0, 1 at 50, 1.5 at 100)', abs(c.get_float_value(0.0) - 0.5) < 1e-3
+                  and abs(c.get_float_value(50.0) - 1.0) < 1e-3 and abs(c.get_float_value(100.0) - 1.5) < 1e-3)
+
+    # ---- master plan Phase 5: the action layer (spec §63-65, §72-73, §119-121) ----
+    AC, EV = unreal.FootballActionComponent, unreal.ActionValidation
+    act = unreal.new_object(unreal.FootballSkillData)  # transient: StartDistance 150, Priority 40, InputBufferTime 0.12
+    act.set_editor_property('contact_descriptors', [unreal.BallContactDescriptor()])
+    ctx = unreal.ActionContext()
+
+    def vin(**kw):
+        v = unreal.ActionValidationInput()
+        v.set_editor_property('ball_valid', True)
+        for k, val in kw.items():
+            v.set_editor_property(k, val)
+        return v
+
+    def val(**kw):
+        return AC.validate_action(act, ctx, vin(**kw))
+    check('§3 skill defaults: priority 40, buffer 0.12 s, start 150 cm', act.priority == 40 and abs(act.input_buffer_time - 0.12) < 1e-6
+          and abs(act.start_distance - 150.0) < 1e-6)
+    check('§119 valid', val() == EV.VALID)
+    check('§119 state', val(player_can_act=False) == EV.INVALID_STATE)
+    check('§119 / §64 busy at equal priority', val(active_priority=40) == EV.BUSY)
+    check('§64 a higher priority takes over', val(active_priority=30) == EV.VALID and val(active_priority=30, active_protected=True) == EV.BUSY)
+    check('recovery holds the same priority, not a higher one', val(recovering_priority=40) == EV.BUSY and val(recovering_priority=30) == EV.VALID)
+    check('§119 cooldown', val(cooldown_left=0.5) == EV.COOLDOWN)
+    check('§119 ball', val(ball_valid=False) == EV.NO_BALL and val(ball_state_allows=False) == EV.BALL_STATE)
+    check('§119 ownership', val(ball_owned_by_other=True) == EV.NOT_OWNER)
+    check('§119 distance', val(ball_distance=151.0) == EV.TOO_FAR and val(ball_distance=150.0) == EV.VALID)
+    check('§119 direction', val(has_direction=False) == EV.WRONG_DIRECTION)
+    check('§73 reachability', val(reachable=False) == EV.UNREACHABLE)
+    check('§119 collision space', val(space_free=False) == EV.NO_SPACE)
+    act.set_editor_property('max_speed', 500.0)
+    slow_ok, fast = val(player_speed=400.0), val(player_speed=600.0)
+    act.set_editor_property('max_speed', 0.0)
+    act.set_editor_property('min_speed', 100.0)
+    too_slow = val(player_speed=50.0)
+    act.set_editor_property('min_speed', 0.0)
+    check('§119 speed range', slow_ok == EV.VALID and fast == EV.WRONG_SPEED and too_slow == EV.WRONG_SPEED and val(player_speed=5000.0) == EV.VALID)
+    act.set_editor_property('allowed_foot', unreal.FootSelection.RIGHT)
+    ctx.set_editor_property('mirrored', True)
+    left_on_right = val()
+    ctx.set_editor_property('mirrored', False)
+    check('§119 foot', left_on_right == EV.WRONG_FOOT and val() == EV.VALID)
+    act.set_editor_property('allowed_foot', unreal.FootSelection.BOTH)
+    act.set_editor_property('contact_descriptors', [])
+    check('§119 no contacts, no ball needed', val(ball_valid=False, ball_distance=900.0) == EV.VALID)
+    check('§63 buffer: transient reasons wait, only for the buffer time', AC.should_buffer(EV.BUSY, 0.05, 0.12) and AC.should_buffer(EV.UNREACHABLE, 0.0, 0.12)
+          and not AC.should_buffer(EV.BUSY, 0.13, 0.12) and not AC.should_buffer(EV.WRONG_FOOT, 0.0, 0.12)
+          and not AC.should_buffer(EV.UNKNOWN_ACTION, 0.0, 0.12) and not AC.should_buffer(EV.CANNOT_PLAY, 0.0, 0.12))
+    check('§121 fallback only when the ball is out of reach', AC.wants_fallback(EV.TOO_FAR) and AC.wants_fallback(EV.UNREACHABLE)
+          and not AC.wants_fallback(EV.BUSY) and not AC.wants_fallback(EV.WRONG_FOOT))
+    prof = unreal.ActionInterruptionProfile()
+    reasons = list(unreal.ActionInterruptReason)
+    check('§65 every reason by default', len(reasons) == 7 and all(AC.allows_interrupt(prof, r) for r in reasons))
+    prof.set_editor_property('allowed_reasons', 1 << unreal.ActionInterruptReason.BALL_LOST.value)
+    check('§65 the mask decides', AC.allows_interrupt(prof, unreal.ActionInterruptReason.BALL_LOST)
+          and not AC.allows_interrupt(prof, unreal.ActionInterruptReason.INTERRUPTED_BY_TACKLE))
+    check('§64 supersedes', AC.supersedes(50, 40, False) and not AC.supersedes(40, 40, False) and not AC.supersedes(50, 40, True))
+
+    def align(ball, offset=V(20, 10, 11), t=0.25, tol=4.0, rot=True, maxpos=30.0, maxrot=20.0, speed=250.0):
+        q = unreal.AlignmentQuery()
+        q.set_editor_property('predicted_ball', ball)
+        q.set_editor_property('predicted_root', V(0, 0, 0))
+        q.set_editor_property('pivot', V(0, 0, 0))
+        q.set_editor_property('basis', R.make_skill_basis(V(0, 0, 0), V(1, 0, 0), False))
+        q.set_editor_property('expected_ball_offset', offset)
+        q.set_editor_property('tolerance', tol)
+        q.set_editor_property('time_available', t)
+        q.set_editor_property('allow_rotation', rot)
+        p = unreal.ActionAlignmentProfile()
+        for k, v in (('align_player', True), ('max_position_correction', maxpos), ('max_rotation_correction', maxrot), ('max_correction_speed', speed)):
+            p.set_editor_property(k, v)
+        q.set_editor_property('profile', p)
+        return AC.calculate_alignment_target(q)
+    a = align(V(20, 10, 11))
+    check('§120 ball on the spot: no correction', a.reachable and a.position_correction.length() < 1e-3 and abs(a.rotation_correction) < 1e-3
+          and a.residual < 1e-3 and str(a.warp_target_name) == 'Contact0')
+    a = align(V(20, 25, 11), rot=False)
+    check('§120 sideways move', a.reachable and near(a.position_correction, V(0, 15, 0)) and near(a.location, V(0, 15, 0)), str(a.position_correction))
+    a = align(V(20, 60, 11), rot=False)
+    check('§120 clamped by distance -> unreachable', not a.reachable and abs(a.position_correction.length() - 30.0) < 1e-3 and abs(a.residual - 20.0) < 1e-3
+          and abs(a.required_correction - 50.0) < 1e-3, '%s %s' % (a.position_correction, a.residual))
+    a = align(V(20, 40, 11), rot=False, t=0.05)
+    check('§120 clamped by speed (do not over-warp)', abs(a.position_correction.length() - 12.5) < 1e-3 and not a.reachable)
+    c15, s15 = 0.9659258, 0.2588190
+    a = align(V(20 * c15 - 10 * s15, 20 * s15 + 10 * c15, 11))
+    check('§120 the turn comes first', a.reachable and abs(a.rotation_correction - 15.0) < 1e-2 and a.position_correction.length() < 1e-2
+          and abs(a.rotation.yaw - 15.0) < 1e-2, '%s %s' % (a.rotation_correction, a.position_correction))
+    c40, s40 = 0.7660444, 0.6427876
+    a = align(V(20 * c40 - 10 * s40, 20 * s40 + 10 * c40, 11))
+    check('§120 the turn is clamped, the move does the rest', abs(a.rotation_correction - 20.0) < 1e-2 and a.position_correction.length() > 1.0 and a.reachable)
+    a = align(V(20, 10, 40))
+    check('§120 height is not warped', not a.reachable and abs(a.residual - 29.0) < 1e-3)
+    BM = unreal.BallMovementComponent
+
+    def predict(p0, v0, air, t, decel=81.0, k=1.425e-4):
+        out = BM.predict_free_motion(p0, v0, air, 11.0, -980.0, decel, k, t)
+        return out if isinstance(out, tuple) else (out, None)
+
+    def euler(v0, decel, k, t, dt=1e-4):
+        x, v, s = 0.0, v0, 0.0
+        while s < t - 1e-12 and v > 0.0:
+            h = min(dt, t - s)
+            acc = decel + k * v * v
+            if v <= acc * h:
+                x += v * v / (2.0 * acc)
+                v = 0.0
+                break
+            x, v, s = x + v * h - 0.5 * acc * h * h, v - acc * h, s + h
+        return x, v
+    worst = 0.0
+    for v0, t in ((340.0, 0.5), (340.0, 3.0), (340.0, 12.0), (900.0, 1.0), (100.0, 2.0), (430.0, 0.2)):
+        (p, vel), (x, v) = predict(V(0, 0, 11), V(v0, 0, 0), False, t), euler(v0, 81.0, 1.425e-4, t)
+        worst = max(worst, abs(p.x - x), abs(vel.x - v))
+    check('§72 rolling closed form = integrated model (cm, cm/s)', worst < 0.05, str(worst))
+    p, _ = predict(V(0, 0, 11), V(340, 0, 0), False, 30.0)
+    check('§72 FIFA roll test: 3.4 m/s stops after 6.50 m (PIE measured 6.57)', abs(p.x - 650.0) < 3.0, str(p.x))
+    p, vel = predict(V(0, 0, 11), V(300, 400, 0), False, 0.3)
+    check('§72 rolls along its direction', abs(p.y / p.x - 4.0 / 3.0) < 1e-4 and abs(vel.y / vel.x - 4.0 / 3.0) < 1e-4)
+    p, vel = predict(V(0, 0, 111), V(300, 0, 0), True, 0.3)
+    check('§72 airborne: ballistic arc', near(p, V(90.0, 0.0, 111.0 - 0.5 * 980.0 * 0.09), 1e-2) and abs(vel.z + 294.0) < 1e-2, str(p))
+    land = (2.0 * 100.0 / 980.0) ** 0.5
+    p, _ = predict(V(0, 0, 111), V(300, 0, 0), True, land + 0.5)
+    roll, _ = euler(300.0, 81.0, 1.425e-4, 0.5)
+    check('§72 airborne: lands, then rolls', abs(p.x - (300.0 * land + roll)) < 0.05 and abs(p.z - 11.0) < 1e-3, '%s vs %s' % (p.x, 300.0 * land + roll))
+    p, vel = predict(V(5, 5, 11), V(0, 0, 0), False, 1.0)
+    check('§72 a still ball stays', near(p, V(5, 5, 11)) and vel.length() < 1e-6)
+    el = unreal.load_asset('/Game/Football/Data/Skills/DA_Skill_Elastico')
+    check('§3 DA_Skill_Elastico tags + fallback + priority', el is not None and 'Action.Football.Skill.Elastico' in el.get_editor_property('action_tag').export_text()
+          and 'Action.Football.Skill' in el.get_editor_property('action_category').export_text()
+          and 'Action.Football.Control.Dribble' in el.get_editor_property('fallback_action_tag').export_text() and el.get_editor_property('priority') == 40)
+    if el:
+        offsets = [d.get_editor_property('expected_ball_offset') for d in el.get_editor_property('contact_descriptors')]
+        check('§71 every Elastico contact has its expected ball offset', len(offsets) == 2 and all(o.length() > 1.0 for o in offsets), str(offsets))
+
+    # ---- master plan Phase 6: the converted Elastico (physical touches, entry momentum, rolling after a touch) ----
+    RV = unreal.BallPhysicsResponse.rolling_velocity
+    check('§6.4 a rolling ball keeps rolling', near(RV(V(250, 40, 0), V(-40 / 11.0, 250 / 11.0, 3.0), 11.0, 0.667), V(250, 40, 0)))
+    check('§6.4 a ball sliding without spin keeps 1/(1+k)', near(RV(V(250, 0, -30), V(0, 0, 0), 11.0, 0.667), V(250 / 1.667, 0, 0)))
+    check('§6.4 topspin on a still ball rolls it forward k/(1+k)', near(RV(V(0, 0, 0), V(0, 100 / 11.0, 0), 11.0, 0.667), V(100 * 0.667 / 1.667, 0, 0)))
+    attrs = unreal.FootballAttributes()
+    attrs.set_editor_property('skill_moves', 70.0)
+    check('§62 GetAttribute by name (-1 if none)', abs(A.get_attribute(attrs, 'SkillMoves') - 70.0) < 1e-6 and A.get_attribute(attrs, 'NoSuchThing') < 0.0)
+    worst = 0.0
+    for dist, t in ((60.0, 0.25), (150.0, 0.6), (400.0, 1.5)):
+        s = BM.speed_to_roll(dist, t, 81.0, 1.425e-4)
+        p, _ = predict(V(0, 0, 11), V(s, 0, 0), False, t)
+        worst = max(worst, abs(p.x - dist))
+    check('§6.4 SpeedToRoll inverts the roll', worst < 0.05, str(worst))
+    s = BM.speed_to_roll(5.0, 1.0, 81.0, 1.425e-4)
+    check('§6.4 SpeedToRoll: a short roll stops there', abs(predict(V(0, 0, 11), V(s, 0, 0), False, 5.0)[0].x - 5.0) < 0.05, str(s))
+    prof = unreal.ActionAlignmentProfile()
+    for k, v in (('align_player', True), ('max_position_correction', 30.0), ('max_rotation_correction', 20.0), ('max_correction_speed', 250.0)):
+        prof.set_editor_property(k, v)
+    q = unreal.AlignmentQuery()
+    for k, v in (('predicted_ball', V(80, 10, 11)), ('entry_offset', V(60, 0, 0)), ('basis', R.make_skill_basis(V(0, 0, 0), V(1, 0, 0), False)),
+                 ('expected_ball_offset', V(20, 10, 11)), ('tolerance', 4.0), ('time_available', 0.25), ('allow_rotation', True), ('profile', prof)):
+        q.set_editor_property(k, v)
+    a = AC.calculate_alignment_target(q)
+    check('§120 the entry momentum is not swung by the turn', a.reachable and abs(a.rotation_correction) < 1e-3 and a.position_correction.length() < 1e-3,
+          '%s %s' % (a.rotation_correction, a.position_correction))
+    tick = unreal.FootballSkillComponent.get_default_object().get_editor_property('primary_component_tick').get_editor_property('tick_group')
+    check('§6.1 the skill ticks after physics (one clock with the ball)', tick == unreal.TickingGroup.TG_POST_PHYSICS, str(tick))
+    if el:
+        ds = el.get_editor_property('contact_descriptors')
+        al = el.get_editor_property('alignment_profile')
+        check('§6.3 Elastico: physical touch + redirect, bounded assist, aligned on the run', len(ds) == 2
+              and [d.get_editor_property('response_mode') for d in ds] == [BRM.PHYSICAL_TOUCH, BRM.PHYSICAL_REDIRECT]
+              and all(d.get_editor_property('assist_strength') <= 0.4 for d in ds) and al.align_player and al.carry_entry_velocity
+              and el.get_editor_property('min_speed') > 0.0)
+
+    # ---- 2026-10-10: the touch dribble (spec §18-22, §67-70, §78; FIFA's dribble touches, master plan 7.3/7.4 brought forward) ----
+    PB, DR = unreal.PlayerBallInteractionComponent, unreal.DribbleTouchReason
+    cdo = PB.get_default_object()
+    walk, sprint, agile = (cdo.get_editor_property(n) for n in ('walk_control', 'sprint_control', 'agile_control'))
+
+    def touch(ball, ball_vel=V(0, 0, 0), player_vel=V(0, 0, 0), desired=V(0, 0, 0), first=False, since=1.0e6, due=0.0,
+              last=DR.NONE, grounded=True, profile=None, pref=None, feet=(0.0, 0.0), sync=None):
+        q = unreal.DribbleTouchQuery()
+        for k, val in dict(player_location=V(0, 0, 88), player_velocity=player_vel, player_forward=V(1, 0, 0), desired_velocity=desired,
+                           ball_location=ball, ball_velocity=ball_vel, ball_grounded=grounded, profile=profile or walk, time_since_touch=since,
+                           time_to_planned_touch=due, last_reason=last, first_touch=first, left_foot_side=feet[0], right_foot_side=feet[1]).items():
+            q.set_editor_property(k, val)
+        if pref is not None:
+            q.set_editor_property('preferred_foot', pref)
+        if sync is not None:  # in step with the feet: dict(l=window now, r=..., age_l, age_r, stride)
+            for k, val in dict(sync_to_feet=True, left_window=sync.get('l', False), right_window=sync.get('r', False),
+                               left_window_age=sync.get('age_l', 0.3), right_window_age=sync.get('age_r', 0.0),
+                               stride_period=sync.get('stride', 0.6), max_window_wait=0.25, turn_window_wait=sync.get('turn_wait', 0.0)).items():
+                q.set_editor_property(k, val)
+        return PB.plan_dribble_touch(q)
+    # (Python names bInReach 'reach': the plugin drops an 'In' prefix.)
+    check('touch dribble is the default', cdo.get_editor_property('touch_dribble'))
+    check('§68 / §69 / §20 profiles: agile closest and quickest, sprint farthest and slowest, reach at the feet only',
+          agile.touch_distance < walk.touch_distance < sprint.touch_distance and agile.control_distance < walk.control_distance < sprint.control_distance
+          and agile.touch_interval < walk.touch_interval < sprint.touch_interval and max(p.touch_reach for p in (walk, sprint, agile)) <= 35.0)
+    r = touch(V(100, 0, 11), V(430, 0, 0), V(430, 0, 0), V(430, 0, 0))
+    check('§70 a ball out of the foot\'s reach is never touched (no pull)', not r.reach and r.reason == DR.NONE and abs(r.distance - 60.0) < 1e-3, str(r.distance))
+    r = touch(V(40, 0, 11), V(0, 300, 0), first=True, grounded=False)
+    check('§70 nor is a ball in the air', not r.reach and r.reason == DR.NONE)
+    r = touch(V(55, 0, 11), V(430, 0, 0), V(430, 0, 0), V(430, 0, 0), since=0.05)
+    check('no two touches closer than MinTouchInterval', r.reach and r.reason == DR.NONE)
+    r = touch(V(55, 0, 11), V(430, 0, 0), V(430, 0, 0), V(430, 0, 0), since=0.3, due=-0.1)
+    check('§18 between planned touches nothing moves the ball', r.reach and r.reason == DR.NONE)
+    r = touch(V(55, 0, 11), V(430, 0, 0), V(430, 0, 0), V(430, 0, 0), since=0.4, due=0.0)
+    end, _ = predict(V(55, 0, 11), r.velocity, False, 0.4)
+    check('§78 a planned touch sends the ball ControlDistance ahead of where the player will be at the next touch',
+          r.reason == DR.PLANNED and abs(r.velocity.y) < 1e-3 and abs(end.x - (430.0 * 0.4 + 55.0)) < 0.5, '%s %s' % (r.velocity, end.x))
+    r = touch(V(55, 0, 11), V(430, 0, 0), V(430, 0, 0), V(0, 430, 0), since=0.2, due=-0.2)
+    turned = math.degrees(math.atan2(r.velocity.y, r.velocity.x))
+    check('§21 a sharp turn: a turn touch, capped, so the ball curves round over more than one touch', r.reason == DR.TURN and r.capped
+          and abs(r.correction - walk.max_correction_speed) < 1e-2 and 25.0 < turned < 85.0, '%s %.1f' % (r.velocity, turned))
+    r = touch(V(55, 0, 11), V(430, 0, 0), V(430, 0, 0), V(0, 0, 0), since=0.2, due=-0.2)
+    rest, _ = predict(V(55, 0, 11), r.velocity, False, 10.0)
+    stop = 430.0 ** 2 / (2.0 * 2200.0)
+    check('§22 stick let go: one stop touch, the ball comes to rest TouchDistance in front of where the player stops',
+          r.reason == DR.STOP and abs(rest.x - (stop + walk.touch_distance)) < 0.5, '%s %.1f' % (r.velocity, rest.x))
+    r = touch(V(60, 0, 11), V(60, 0, 0), desired=V(0, 0, 0), since=0.2, last=DR.STOP)
+    check('§22 ... and only one', r.reason == DR.NONE)
+    r = touch(V(40, 0, 11), desired=V(430, 0, 0))
+    check('setting off: a still ball at the feet is pushed ahead', r.reason == DR.START and r.velocity.x > 100.0 and abs(r.velocity.y) < 1e-3, str(r.velocity))
+    r = touch(V(20, 0, 11), V(200, 0, 0), V(430, 0, 0), V(430, 0, 0), since=0.2, due=-0.2)
+    check('the player running over the ball touches it on', r.reason == DR.OVERRUN and r.velocity.x > 200.0, str(r.velocity))
+    r = touch(V(40, 0, 11), V(-600, 0, 0), first=True)
+    check('§22 / §127 a first touch on a ball coming at the player takes the pace off it, bounded', r.reason == DR.FIRST_TOUCH and r.capped
+          and abs(r.velocity.x - (-600.0 + walk.max_correction_speed)) < 1e-2, str(r.velocity))
+    r = touch(V(10, 50, 11), V(300, 0, 0), V(300, 0, 0), V(0, 430, 0), since=0.2, due=-0.2)
+    loose = touch(V(10, 50, 11), first=True)
+    check('§21 a held ball beside the player can still be turned; a loose one there is not taken', r.reach and r.reason == DR.TURN
+          and not loose.reach and loose.reason == DR.NONE)
+    r = touch(V(-40, 0, 11), V(0, 0, 0), V(430, 0, 0), V(430, 0, 0), since=0.2, due=0.0)
+    heel = touch(V(-20, 0, 11), V(400, 0, 0), V(430, 0, 0), V(430, 0, 0), since=0.2, due=0.0)
+    check('a ball left behind the player is out of reach; one at the heels is not', not r.reach and r.reason == DR.NONE
+          and heel.reach and heel.reason != DR.NONE)
+    # Step 2 (2026-10-20): the foot on the ball's side touches it, the preferred one with the ball in the middle; and the ball
+    # is sent on in front of that foot.
+    FS = unreal.FootSelection
+    left, right = (touch(V(55, y, 11), V(430, 0, 0), V(430, 0, 0), V(430, 0, 0), since=0.4, due=0.0) for y in (-20, 20))
+    mid_r = touch(V(55, 0, 11), V(430, 0, 0), V(430, 0, 0), V(430, 0, 0), since=0.4, due=0.0)
+    mid_l = touch(V(55, 0, 11), V(430, 0, 0), V(430, 0, 0), V(430, 0, 0), since=0.4, due=0.0, pref=FS.LEFT)
+    check('the foot on the ball\'s side touches it; in the middle the preferred foot', left.foot == FS.LEFT and right.foot == FS.RIGHT
+          and mid_r.foot == FS.RIGHT and mid_l.foot == FS.LEFT, '%s %s %s %s' % (left.foot, right.foot, mid_r.foot, mid_l.foot))
+    side = touch(V(55, 12, 11), V(430, 0, 0), V(430, 0, 0), V(430, 0, 0), since=0.4, due=0.0, feet=(-12.0, 12.0))
+    end, _ = predict(V(55, 12, 11), side.velocity, False, 0.4)
+    check('the ball is sent on in front of the touching foot', side.foot == FS.RIGHT and side.reason == DR.PLANNED and abs(end.y - 12.0) < 0.5,
+          '%s %s' % (side.velocity, end.y))
+    # 2026-10-24: touches in step with the feet - a planned touch at the touching foot's window (late swing, the run loops'
+    # Dribble Foot Window notify), once a stride, sending the ball to where that foot will be a stride later; no window, no
+    # planned touch until MaxWindowWait late; any touch plans to the touching foot's next usable window.
+    run = dict(ball=V(55, 0, 11), ball_vel=V(430, 0, 0), player_vel=V(430, 0, 0), desired=V(430, 0, 0))
+    wait = touch(since=0.5, due=0.1, sync=dict(), **run)
+    at_win = touch(since=0.6, due=0.0, sync=dict(r=True), **run)
+    other = touch(since=0.6, due=0.0, sync=dict(l=True, age_l=0.0, age_r=0.3), **run)
+    twice = touch(since=0.2, due=-0.4, sync=dict(r=True), **run)
+    late = touch(since=1.2, due=0.6, sync=dict(age_r=0.25), **run)
+    waiting = touch(since=0.85, due=0.3, sync=dict(age_r=0.25), **run)
+    end, _ = predict(V(55, 0, 11), at_win.velocity, False, 0.6)
+    check('in step with the feet: the planned touch waits for the touching foot\'s window (not the other foot\'s, not twice a stride) ...',
+          wait.reason == DR.NONE and other.reason == DR.NONE and twice.reason == DR.NONE and at_win.reason == DR.PLANNED,
+          '%s %s %s %s' % (wait.reason, other.reason, twice.reason, at_win.reason))
+    check('... and sends the ball ControlDistance ahead of where the player will be at that foot\'s next window (a stride on)',
+          abs(at_win.interval - 0.6) < 1e-4 and abs(end.x - (430.0 * 0.6 + 55.0)) < 0.5, '%s %s' % (at_win.interval, end.x))
+    check('... and never waits for it longer than a stride: a stride late the planned touch is made without the window, before that not',
+          late.reason == DR.PLANNED and waiting.reason == DR.NONE, '%s %s' % (late.reason, waiting.reason))
+    turn = touch(V(55, 0, 11), V(430, 0, 0), V(430, 0, 0), V(0, 430, 0), since=0.2, due=-0.2, sync=dict(age_r=0.45))
+    turn2 = touch(V(55, 0, 11), V(430, 0, 0), V(430, 0, 0), V(0, 430, 0), since=0.2, due=-0.2, sync=dict(age_r=0.1))
+    check('... a touch between windows (a turn) plans to the foot\'s next usable window: 0.15 s away is too soon (half a stride), so 0.75 s; 0.5 s away is kept',
+          turn.reason == DR.TURN and abs(turn.interval - 0.75) < 1e-4 and abs(turn2.interval - 0.5) < 1e-4, '%s %s' % (turn.interval, turn2.interval))
+    tq = dict(ball=V(55, 0, 11), ball_vel=V(430, 0, 0), player_vel=V(430, 0, 0), desired=V(0, 430, 0), since=0.2, due=-0.2, feet=(-12.0, 12.0))
+    soon = touch(sync=dict(age_r=0.55, age_l=0.25, turn_wait=0.1), **tq)       # the right foot comes through in 0.05 s
+    now = touch(sync=dict(age_r=0.55, age_l=0.25, turn_wait=0.0), **tq)
+    by_left = touch(sync=dict(l=True, age_l=0.0, age_r=0.3, turn_wait=0.1), **tq)
+    none_near = touch(sync=dict(age_r=0.2, age_l=0.45, turn_wait=0.1), **tq)  # the next windows 0.4 / 0.15 s away
+    check('in step with the feet a turn touch waits for a foot coming through within TurnWindowWait (0 = at once), is made by '
+          'the foot whose window it is (in a turn the ball changes sides), and is made at once with no foot that close',
+          soon.reason == DR.NONE and now.reason == DR.TURN and by_left.reason == DR.TURN and by_left.foot == FS.LEFT
+          and none_near.reason == DR.TURN, '%s %s %s %s %s' % (soon.reason, now.reason, by_left.reason, by_left.foot, none_near.reason))
+    # 2026-10-20 turn fix: a nearly still player reaches a ball close behind him (a drag-back), a moving one doesn't.
+    slow = touch(V(-40, 0, 11), V(0, 0, 0), V(0, 0, 0), V(-430, 0, 0), since=0.2)
+    check('a still player reaches a ball at his heels 40 cm behind and sets off with it', slow.reach and slow.reason == DR.START, str(slow.reason))
+    # Step 4 (2026-10-20): which foot kicks, and what the weak foot costs.
+    ck = lambda ball, aim, weak=50.0: PB.choose_kick_foot(V(0, 0, 88), V(1, 0, 0), ball, aim, FS.RIGHT, weak)
+    a, b, c, d = ck(V(40, 0, 11), V(1, 0, 0)), ck(V(40, -20, 11), V(1, 0, 0)), ck(V(40, 0, 11), V(1, 1.7, 0)), ck(V(40, -20, 11), V(1, 0, 0), 0.0)
+    check('kick foot: the strong foot straight on; the left foot for a ball 20 cm to the left or a kick 60 deg out to the right; a 0 weak foot keeps the strong one',
+          a.foot == FS.RIGHT and not a.weak_foot and b.foot == FS.LEFT and c.foot == FS.LEFT and d.foot == FS.RIGHT, '%s %s %s %s' % (a.foot, b.foot, c.foot, d.foot))
+    check('the weak foot (WeakFoot 50) loses 7.5% speed and aims up to 4 deg off; the strong foot loses nothing',
+          b.weak_foot and abs(b.speed_scale - 0.925) < 1e-3 and abs(b.error_deg - 4.0) < 1e-3 and a.speed_scale == 1.0 and a.error_deg == 0.0,
+          '%s %s' % (b.speed_scale, b.error_deg))
+    r = touch(V(50, 0, 11), V(430, 0, 0), V(430, 0, 0), V(150, 0, 0), since=0.2, due=-0.25)
+    check('the player slows: the ball would run out of reach before the next touch, so it is corrected now', r.reason == DR.CORRECT
+          and r.velocity.x < 430.0, str(r.velocity))
+    r = touch(V(64, 0, 11), V(420, 0, 0), V(430, 0, 0), V(250, 0, 0), since=0.25, due=-0.2, profile=agile)
+    check('RB pressed with the ball at walking distance: still within the legs\' reach (the same in every profile), corrected closer',
+          r.reach and r.reason == DR.CORRECT and r.velocity.x < 420.0, str(r.velocity))
+    rnd, bad = random.Random(17), []
+    for n in range(400):
+        prof = rnd.choice((walk, sprint, agile))
+        ang = rnd.uniform(0, 2 * math.pi)
+        rad = rnd.uniform(0, prof.touch_reach)
+        ball = V(prof.touch_distance + rad * math.cos(ang), rad * math.sin(ang), 11)
+        bv, pv = V(rnd.uniform(-900, 900), rnd.uniform(-900, 900), 0), V(rnd.uniform(-660, 660), rnd.uniform(-660, 660), 0)
+        dv = rnd.choice((V(0, 0, 0), V(rnd.uniform(-660, 660), rnd.uniform(-660, 660), 0)))
+        r = touch(ball, bv, pv, dv, first=rnd.random() < 0.3, since=rnd.uniform(0, 1), due=rnd.uniform(-0.5, 0.5), profile=prof)
+        if r.reason != DR.NONE and (V(r.velocity.x - bv.x, r.velocity.y - bv.y, 0).length() > prof.max_correction_speed + 1e-2
+                                    or abs(r.velocity.z - bv.z) > 1e-6):
+            bad.append(n)
+        far = touch(V(prof.touch_distance + prof.touch_reach + 1.0 + rnd.uniform(0, 300), 0, 11), bv, pv, dv, first=True, profile=prof)
+        if far.reason != DR.NONE:
+            bad.append(('far', n))
+    check('§70 every touch is bounded and keeps the vertical velocity; nothing out of reach is ever touched (400 random)', not bad, str(bad[:4]))
+    D = PB.predict_player_displacement
+    check('player prediction: steady, setting off, stopping', near(D(V(430, 0, 0), V(430, 0, 0), 1800.0, 2200.0, 0.4), V(172, 0, 0), 1e-3)
+          and abs(D(V(0, 0, 0), V(430, 0, 0), 1800.0, 2200.0, 0.4).x - (430.0 * 0.5 * 430.0 / 1800.0 + 430.0 * (0.4 - 430.0 / 1800.0))) < 1e-3
+          and abs(D(V(430, 0, 0), V(0, 0, 0), 1800.0, 2200.0, 5.0).x - stop) < 1e-3)
+    mid = PB.blend_control_profiles(walk, sprint, 0.5)
+    check('profile blend', abs(mid.control_distance - 0.5 * (walk.control_distance + sprint.control_distance)) < 1e-3
+          and abs(mid.touch_interval - 0.5 * (walk.touch_interval + sprint.touch_interval)) < 1e-4)
+
     # Region table vs the enum and the mesh.
     table = unreal.load_asset(TABLE)
     mesh = unreal.load_asset(MESH)

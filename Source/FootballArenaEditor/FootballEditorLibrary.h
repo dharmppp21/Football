@@ -7,6 +7,7 @@
 class UAnimBlueprint;
 class UAnimMontage;
 class UAnimSequence;
+class UBlendSpace;
 class UBlueprint;
 class UMirrorDataTable;
 class USkeleton;
@@ -44,4 +45,29 @@ public:
 	// Returns JSON {success, path, rows, pairs} or {success:false, message}.
 	UFUNCTION(BlueprintCallable, Category = "Football|Editor")
 	static FString CreateMirrorDataTable(USkeleton* Skeleton, const FString& AssetPath);
+
+	// Feeds the AnimGraph's first Slot from a Blend Space Player playing BlendSpace with X <- XVariable and Y <- YVariable
+	// (member variables of the AnimBP's class), replacing the node that fed the Slot, rebuilds the blend space's sample grid
+	// and compiles. Returns JSON {success, compiled, node_name, replaced} or {success:false, message}.
+	UFUNCTION(BlueprintCallable, Category = "Football|Editor")
+	static FString SetSlotSourceBlendSpace(UAnimBlueprint* AnimBP, UBlendSpace* BlendSpace, FName XVariable, FName YVariable);
+
+	// What the blend space editor does after a sample edit, which a scripted sample_data set skips: validates the samples
+	// (this also picks the sample whose sync markers drive marker-based sync) and rebuilds the grid. Save the asset afterwards.
+	// Returns JSON {success, samples, valid, marker_sample} (marker_sample -1 = no marker-based sync) or {success:false, message}.
+	UFUNCTION(BlueprintCallable, Category = "Football|Editor")
+	static FString RefreshBlendSpace(UBlendSpace* BlendSpace);
+
+	// Makes Blueprint implement Interface (if it doesn't) and gives the interface's function FunctionName one body: a call of
+	// LibraryClass::LibraryFunction(self, <its struct output>) feeding the function's struct output - e.g. the Game Animation
+	// Sample's BPI_SandboxCharacter_Pawn::Get_PropertiesForAnimation <- UFootballAnimPropertiesLibrary::FillSandboxAnimationProperties.
+	// Replaces any earlier body, compiles. Returns JSON {success, compiled} or {success:false, message}.
+	UFUNCTION(BlueprintCallable, Category = "Football|Editor")
+	static FString ImplementInterfaceFunctionWithCall(UBlueprint* Blueprint, UClass* Interface, FName FunctionName, UClass* LibraryClass, FName LibraryFunction);
+
+	// Feeds the AnimGraph's first Slot from a Two Way Blend: A = Retarget Pose From Mesh (Retargeter, source mesh = the member
+	// variable SourceMeshVariable), B = whatever fed the Slot until now (the blend space player), Alpha = AlphaVariable. Compiles.
+	// Returns JSON {success, compiled, retarget_pins} or {success:false, message}.
+	UFUNCTION(BlueprintCallable, Category = "Football|Editor")
+	static FString SetSlotSourceRetargetBlend(UAnimBlueprint* AnimBP, UObject* Retargeter, FName SourceMeshVariable, FName AlphaVariable);
 };

@@ -30,8 +30,10 @@ RATES = {30: 30.0, 60: 59.9988, 120: 120.0}  # 59.9988 = the two physics substep
 # Recorded 2026-10-08 after master plan U5 (knuckle removed, grass spin friction, kicks set their topspin / backspin,
 # the shoot's backspin, restitution 0.66 for the FIFA rebound test) with run('ubase2NN', ..., NN). Before: ubaseNN (U1-U4),
 # p3baseNN (after 3.1), baselineNN, phase1kick_NN, phase1defl_NN, phase1post_NN.
+# skills: recorded 2026-10-10 with run('p6base60', ...) after master plan 6.4 (the converted elastico, played on the run; the
+# scenarios changed then, so the ubase2 skills runs no longer compare).
 BASELINES = {'parity': 'ubase2{fps}_parity{fps}', 'kicks': 'ubase2{fps}_kicks{fps}', 'deflections': 'ubase2{fps}_deflections{fps}',
-             'skills': 'ubase2{fps}_skills{fps}'}
+             'skills': 'p6base{fps}_skills{fps}'}
 ALL = ['selftest', 'parity', 'kicks', 'deflections', 'skills', 'reset']
 QUICK = ['parity', 'reset']
 TOL = dict(recorded=0.05, deflection=0.5,  # cm; cm/s of formula error
@@ -169,7 +171,9 @@ SUITES = {
 
 # ---------------------------------------------------------------- driver
 
-def run(label, suites=None, fps=60):
+def run(label, suites=None, fps=60, pbi=None):
+    """pbi: PlayerBallInteraction properties set on the PIE player before the suites, e.g. {'touch_dribble': False} for the
+    old servo dribble (A/B against baselines recorded with it)."""
     if _state.get('handle') is not None:
         return 'already running'
     suites = list(suites or ALL)
@@ -183,7 +187,7 @@ def run(label, suites=None, fps=60):
         os.remove(path)  # the wait watches for this file
     _state.clear()
     _state.update(label=label, fps=fps, mods=mods, results={}, t0=time.time(), result='running', index=0, phase='pie',
-                  pie_suites=[s for s in suites if s != 'selftest'])
+                  pie_suites=[s for s in suites if s != 'selftest'], pbi=dict(pbi or {}))
     if 'selftest' in suites:
         try:
             _state['results']['selftest'] = _selftest()
@@ -211,6 +215,8 @@ def _tick(delta):
             ball, player = s['mods']['ball_parity_test']._actors(world)
             if ball is None or player is None or player.get_component_by_class(unreal.PlayerBallInteractionComponent).get_loaded_region_count() == 0:
                 return
+            for key, value in s['pbi'].items():
+                player.get_component_by_class(unreal.PlayerBallInteractionComponent).set_editor_property(key, value)
             s.update(phase='settle', until=unreal.GameplayStatics.get_time_seconds(world) + 0.5)
             return
         if world is None:
@@ -295,7 +301,7 @@ def _write():
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, s['label'] + '.json')
     with open(path + '.tmp', 'w', encoding='utf-8') as f:
-        json.dump(dict(label=s['label'], fps=s['fps'], result=s['result'], seconds=round(time.time() - s['t0'], 1),
+        json.dump(dict(label=s['label'], fps=s['fps'], result=s['result'], seconds=round(time.time() - s['t0'], 1), pbi=s.get('pbi', {}),
                        suites=s['results']), f, indent=1)
     os.replace(path + '.tmp', path)  # the watcher only ever sees a complete file
 

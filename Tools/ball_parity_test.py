@@ -69,8 +69,11 @@ BP_KICKS = {  # name: (base power, floor, exponent, lift, spin right per lerp, s
     'pass': (2397.0, 0.20, 1.172, 0.03, 0.0, -520.0, True),
     'through': (3104.0, 0.20, 1.290, 0.08, 0.0, -520.0, True),
     'finesse_r': (3571.0, 0.22, 1.35, 0.301, 425.0, 0.0, False),
-    'finesse_l': (3571.0, 0.22, 1.35, 0.301, -425.0, 0.0, False),
     'lob': (2588.0, 0.19, 1.15, 0.601, 0.0, 144.0, False),
+    # FIFA 22 layout (2026-10-31): LB+B is the chip (it replaced the left finesse; the game's finesse curl now follows the
+    # kicking foot in C++ Launch, so a rig kick without a kicker keeps the sign given here), LB+RB+B the low driven shot.
+    'chip': (2100.0, 0.30, 1.3, (0.50, 1.05), 0.0, 120.0, False),  # lift rises with the charge: a tap is a low dink
+    'low': (3580.0, 0.20, 1.25, 0.09, 0.0, -40.0, True),
 }
 GOAL_LINE_X = 5270.0
 KICK_SPOT = (GOAL_LINE_X - 2000.0, 0.0, 11.0)
@@ -82,7 +85,7 @@ def kick_baseline_scenarios(charges=(0.4, 0.75, 1.0), duration=3.0):
         for charge in charges:
             k = floor + (1.0 - floor) * charge ** exp
             out.append(dict(name='%s_%d' % (name, round(charge * 100)), kind='kick', spot=KICK_SPOT, dir=(1.0, 0.0, 0.0),
-                            power=base * k, lift=lift, spin_right=spin_right * k, spin_top=spin_top * (k if top_scales else 1.0),
+                            power=base * k, lift=lift[0] + (lift[1] - lift[0]) * charge if isinstance(lift, tuple) else lift, spin_right=spin_right * k, spin_top=spin_top * (k if top_scales else 1.0),
                             duration=duration, charge=charge))
     return out
 

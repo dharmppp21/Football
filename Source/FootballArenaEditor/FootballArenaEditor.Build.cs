@@ -10,7 +10,7 @@ public class FootballArenaEditor : ModuleRules
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine" });
 
 		PrivateDependencyModuleNames.AddRange(new string[] {
-			"UnrealEd", "Kismet", "BlueprintGraph", "AnimGraph", "AnimGraphRuntime", "Json", "AssetTools", "AssetRegistry"
+			"UnrealEd", "Kismet", "BlueprintGraph", "AnimGraph", "AnimGraphRuntime", "Json", "AssetTools", "AssetRegistry", "IKRig", "IKRigDeveloper"
 		});
 	}
 }
