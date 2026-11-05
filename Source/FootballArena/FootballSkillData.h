@@ -1,36 +1,20 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Engine/DataAsset.h"
-#include "GameplayTagContainer.h"
+#include "FootballActionData.h"
 #include "FootballTypes.h"
 #include "FootballSkillData.generated.h"
 
-class UAnimMontage;
 class UBallTrajectoryData;
 
-// One skill (DA_Skill_*, doc §10, §34): the montage it plays, its contacts, its ball path and its tuning.
-// The montage's Ball Contact Window notifies time the contacts; each one points at an entry of ContactDescriptors.
-// A new skill = a montage + this asset + its descriptors + a trajectory (doc §40), no code.
+// One skill (DA_Skill_*, doc §10, §34): an action played as a montage with physical ball touches, by
+// UFootballSkillComponent. The montage's Ball Contact Window notifies time the contacts; each one points at an entry of
+// ContactDescriptors. A new skill = a montage + this asset + its descriptors (doc §40), no code.
 UCLASS(BlueprintType)
-class FOOTBALLARENA_API UFootballSkillData : public UPrimaryDataAsset {
+class FOOTBALLARENA_API UFootballSkillData : public UFootballActionData {
 	GENERATED_BODY()
 public:
-	// Identity (doc §27). UFootballSkillComponent::RequestSkillByTag finds the skill by it.
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Skill")
-	FGameplayTag SkillTag;
-
-	// The right-foot version.
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Skill")
-	TObjectPtr<UAnimMontage> Montage;
-
-	// The left-foot version: a montage of the baked mirrored clip (UFootballEditorLibrary::BakeMirroredSequence),
-	// with the same contact windows.
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Skill")
-	TObjectPtr<UAnimMontage> MirroredMontage;
-
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Skill")
-	EFootSelection AllowedFeet = EFootSelection::Both;
+	UFootballSkillData() { Priority = 40; } // spec §64: a skill outranks a receive and a dribble touch, never a shot
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Skill", meta = (ClampMin = "0.1"))
 	float PlayRate = 1.f;
@@ -45,15 +29,8 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Skill")
 	FName RootRightCurve = TEXT("RootRight");
 
-	// Directions the skill can go, relative to the facing (doc §28). The input direction snaps to the nearest one.
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Skill", meta = (Bitmask, BitmaskEnum = "/Script/FootballArena.ESkillDirection"))
-	int32 AllowedDirections = 0xFF;
-
-	// Contacts (doc §5), for the right-foot version; the left-foot version mirrors their body regions.
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Contacts")
-	TArray<FBallContactDescriptor> ContactDescriptors;
-
-	// The ball path around and between the contacts (doc §13–§14).
+	// The ball path the bake predicts for the skill's reference run (doc §13–§14): debug preview and QA only (spec §138).
+	// Nothing at runtime follows it - the ball is physical.
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Contacts")
 	TObjectPtr<UBallTrajectoryData> TrajectoryProfile;
 
@@ -68,20 +45,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tuning")
 	float ContactTolerance = 0.f;
 
-	// Refused if the ball is farther than this from the player (cm).
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Start")
-	float MaxStartDistance = 150.f;
-
-	// Refused if the ball would need to move faster than this to reach the first contact (cm/s).
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Start")
-	float MaxApproachSpeed = 600.f;
-
 	// Seconds the skill takes at PlayRate (doc §10 Duration).
 	UFUNCTION(BlueprintPure, Category = "Football|Skill")
 	float GetDuration() const;
-
-	UFUNCTION(BlueprintPure, Category = "Football|Skill")
-	UAnimMontage* GetMontage(bool bMirrored) const { return bMirrored ? MirroredMontage : Montage; }
 
 	// Descriptor Index with the tuning above applied, and its body region mirrored for the left-foot version.
 	UFUNCTION(BlueprintPure, Category = "Football|Skill")

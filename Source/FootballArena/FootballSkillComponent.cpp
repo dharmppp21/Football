@@ -4,31 +4,45 @@
 #include "Animation/AnimMontage.h"
 #include "Animation/AnimSequenceBase.h"
 #include "AssetRegistry/IAssetRegistry.h"
+#include "BallAssist.h"
 #include "BallContactResolver.h"
 #include "BallInteractionComponent.h"
 #include "BallMovementComponent.h"
+#include "BallPhysicsResponse.h"
 #include "BallStateComponent.h"
-#include "BallTrajectoryData.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "DrawDebugHelpers.h"
+#include "FootballActionComponent.h"
 #include "FootballSkillData.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/Controller.h"
+#include "PlayerAttributesData.h"
 #include "PlayerBallInteractionComponent.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogFootballSkill, Log, All);
 
-// Carries: the body stays on the ball and pushes it along (a sweep, a drag, a trap); the ball separates by itself when
-// the body stops pushing. The other contact types are one collision (a touch, a strike, a header).
-static bool IsCarry(EContactType Type) {
-	return Type == EContactType::Control || Type == EContactType::Trap || Type == EContactType::Redirect || Type == EContactType::Release;
+// Spec §122. Carries: the body stays on the ball and pushes it along (a controlled drag, a trap, a capture) every tick it
+// presses; the ball separates by itself when the body stops pushing. The other modes are one collision.
+static bool IsCarry(EBallResponseMode Mode) {
+	return Mode == EBallResponseMode::ControlledContact || Mode == EBallResponseMode::EnergyAbsorption || Mode == EBallResponseMode::Capture;
 }
+
+static float Smooth01(float X) {
+	return FMath::SmoothStep(0.f, 1.f, FMath::Clamp(X, 0.f, 1.f));
+}
+
+// Upward speed (cm/s) below which a touched grounded ball stays on the ground and rolls: a hop of under ~1.3 cm.
+// one fixed bound; make it per contact when a skill flicks the ball up on purpose.
+static constexpr double MaxRollingLift = 50.0;
 
 UFootballSkillComponent::UFootballSkillComponent() {
 	PrimaryComponentTick.bCanEverTick = true;
 	PrimaryComponentTick.bStartWithTickEnabled = false; // ticks only while a skill plays, and for the recorder's tail
-	PrimaryComponentTick.TickGroup = TG_PrePhysics;     // ball moves made here go into this frame's physics step
+	// After physics (master plan 6.1/6.4): the ball is where this frame's step left it, the same moment as the capsule and
+	// the pose the skill moves and reads, so the swept touch and the predictions share one clock (before physics the ball
+	// was a frame old: the foot met it one frame early, more at 30 fps). A touch lands in the next step, which starts there.
+	PrimaryComponentTick.TickGroup = TG_PostPhysics;
 	SkillDirectory.Path = TEXT("/Game/Football/Data/Skills");
 }
 
@@ -160,75 +174,249 @@ void UFootballSkillComponent::UpdateTurn() {
 	bTurning = Alpha < 1.f;
 }
 
+void UFootballSkillComponent::ApplyAlignment(float T) {
+	if (!bWarping) {
+		return;
+	}
+	const float Span = Alignment.WindowEnd - Alignment.WindowStart;
+	const float X = Span > UE_KINDA_SMALL_NUMBER ? FMath::Clamp((T - Alignment.WindowStart) / Span, 0.f, 1.f) : 1.f;
+	const float Alpha = FMath::SmoothStep(0.f, 1.f, X);
+	const FVector Step = Alignment.PositionCorrection * double(Alpha - WarpAlpha);
+	WarpAlpha = Alpha;
+	if (!Step.IsNearlyZero()) {
+		FHitResult Hit;
+		const FVector Before = GetOwner()->GetActorLocation();
+		GetOwner()->AddActorWorldOffset(Step, true, &Hit);
+		AlignmentApplied += GetOwner()->GetActorLocation() - Before;
+	}
+	bWarping = Alpha < 1.f;
+}
+
+void UFootballSkillComponent::Realign(int32 NextIndex, float T) {
+	const FWindow& Next = Windows[NextIndex];
+	const FBallContactDescriptor D = ActiveSkill->GetTunedDescriptor(Next.ContactIndex, bActiveMirrored);
+	if (D.ExpectedBallOffset.IsNearlyZero() || D.ContactTime <= T) {
+		return;
+	}
+	const float Rate = GetPlayRate();
+	// What is left of the current warp still moves the player; the new one adds what the next contact needs on top.
+	const FVector Remaining = bWarping ? Alignment.PositionCorrection * double(1.f - WarpAlpha) : FVector::ZeroVector;
+	FAlignmentQuery Query;
+	FVector BallVelocity;
+	Query.PredictedBall = BallMovement->PredictFreeBall((D.ContactTime - T) / Rate, BallVelocity);
+	Query.Pivot = GroundRoot();
+	const FVector2D Travel = SampleTrack(D.ContactTime) - PrevTrack;
+	Query.PredictedRoot = Query.Pivot + Basis.TransformVector(FVector(Travel.X, Travel.Y, 0.0)) + Remaining;
+	Query.EntryOffset = EntryDisplacement(T, D.ContactTime);
+	Query.Basis = Basis;
+	Query.ExpectedBallOffset = D.ExpectedBallOffset;
+	Query.Tolerance = D.ContactTolerance;
+	Query.TimeAvailable = (D.ContactTime - T) / Rate;
+	Query.WindowStart = T;
+	Query.WindowEnd = D.ContactTime;
+	Query.ContactIndex = Next.ContactIndex;
+	Query.bAllowRotation = false;
+	Query.Profile = ActiveSkill->AlignmentProfile;
+	Alignment = UFootballActionComponent::CalculateAlignmentTarget(Query);
+	Alignment.PositionCorrection += Remaining;
+	WarpAlpha = 0.f;
+	bWarping = !Alignment.PositionCorrection.IsNearlyZero();
+	if (!Alignment.bReachable) {
+		UE_LOG(LogFootballSkill, Log, TEXT("%s: re-aligning for contact %d leaves the ball %.1f cm off (%.1f needed)"), *ActiveSkill->GetName(),
+			Next.ContactIndex, Alignment.Residual, Alignment.RequiredCorrection);
+	}
+}
+
+FVector UFootballSkillComponent::EntryDisplacement(float FromT, float ToT) const {
+	if (!bEntryMomentum || ToT <= FromT) {
+		return FVector::ZeroVector;
+	}
+	const double Rate = GetPlayRate();
+	const double Hold = EntryHoldTime / Rate;
+	const double Tau = FMath::Max(double(EntryDecayTime), 0.01);
+	// Seconds of full-speed travel by montage time T: all of it until the hold ends, then fading.
+	const auto FullSpeedSeconds = [&](float T) {
+		const double S = T / Rate;
+		return S <= Hold ? S : Hold + Tau * (1.0 - FMath::Exp(-(S - Hold) / Tau));
+	};
+	return EntryVelocity * (FullSpeedSeconds(ToT) - FullSpeedSeconds(FromT));
+}
+
+void UFootballSkillComponent::ApplyEntryMomentum(float T) {
+	const FVector Step = EntryDisplacement(LastMontageTime, T);
+	if (!Step.IsNearlyZero()) {
+		GetOwner()->AddActorWorldOffset(Step, true);
+	}
+}
+
+FVector UFootballSkillComponent::PredictRootAt(float ContactTime, float T) const {
+	const FVector2D Travel = SampleTrack(ContactTime) - PrevTrack;
+	FVector Root = GroundRoot() + Basis.TransformVector(FVector(Travel.X, Travel.Y, 0.0));
+	if (bWarping) {
+		const float Span = Alignment.WindowEnd - Alignment.WindowStart;
+		const float By = Span > UE_KINDA_SMALL_NUMBER ? Smooth01((ContactTime - Alignment.WindowStart) / Span) : 1.f;
+		Root += Alignment.PositionCorrection * double(FMath::Max(By - WarpAlpha, 0.f));
+	}
+	return Root;
+}
+
+FVector UFootballSkillComponent::PredictContactSpot(int32 Index, float T) const {
+	const FBallContactDescriptor D = ActiveSkill->GetTunedDescriptor(Windows[Index].ContactIndex, bActiveMirrored);
+	return PredictRootAt(D.ContactTime, T) + EntryDisplacement(T, D.ContactTime) + Basis.TransformVector(D.ExpectedBallOffset);
+}
+
+FVector UFootballSkillComponent::IntentToward(int32 NextIndex, float T, const FVector& From) const {
+	const FBallContactDescriptor D = ActiveSkill->GetTunedDescriptor(Windows[NextIndex].ContactIndex, bActiveMirrored);
+	const FVector Spot = PredictContactSpot(NextIndex, T);
+	const FVector Chord(Spot.X - From.X, Spot.Y - From.Y, 0.0);
+	const float Time = FMath::Max((D.ContactTime - T) / GetPlayRate(), 0.05f);
+	float Decel = 0.f, DragK = 0.f;
+	BallMovement->GetRollModel(Decel, DragK);
+	return Chord.GetSafeNormal() * double(UBallMovementComponent::SpeedToRoll(float(Chord.Size()), Time, Decel, DragK));
+}
+
+FBallAssistInput UFootballSkillComponent::ScaleAssistForPlayer(const FBallAssistInput& Input) const {
+	if (!ActiveSkill->AssistProfile.bScaleWithPlayerSkill) {
+		return Input;
+	}
+	const UFootballActionComponent* Actions = GetOwner()->FindComponentByClass<UFootballActionComponent>();
+	const UPlayerAttributesData* Attributes = Actions ? Actions->GetAttributes() : nullptr;
+	if (!Attributes) {
+		return Input;
+	}
+	const float Skill = UBallAssist::GetAttribute(Attributes->Attributes, ActiveSkill->AttributeProfile.AssistAttribute);
+	return Skill >= 0.f ? UBallAssist::ScaleForSkill(Input, Skill, Attributes->SkillToAssistScale) : Input;
+}
+
 FVector UFootballSkillComponent::GroundRoot() const {
 	const FVector Location = GetOwner()->GetActorLocation();
 	return FVector(Location.X, Location.Y, BallMovement ? BallMovement->GetGroundZ() : Location.Z);
 }
 
+FVector UFootballSkillComponent::GroundRootAt(float At, float Now) const {
+	const FVector2D Travel = SampleTrack(Now) - SampleTrack(At);
+	FVector Since = Basis.TransformVector(FVector(Travel.X, Travel.Y, 0.0)) + EntryDisplacement(At, Now);
+	const float Span = Alignment.WindowEnd - Alignment.WindowStart;
+	if (Span > UE_KINDA_SMALL_NUMBER) {
+		Since += Alignment.PositionCorrection * double(Smooth01((Now - Alignment.WindowStart) / Span) - Smooth01((At - Alignment.WindowStart) / Span));
+	}
+	return GroundRoot() - Since;
+}
+
+bool UFootballSkillComponent::BakedRegionAt(const FBallContactDescriptor& D, float At, float Now, FVector& OutPoint, FVector& OutNormal) const {
+	const int32 N = D.RegionPath.Num();
+	if (N < 2 || D.RegionPathNormal.Num() != N || D.RegionPathStep <= 0.f) {
+		return false;
+	}
+	const float K = FMath::Clamp((At - D.RegionPathStart) / D.RegionPathStep, 0.f, float(N - 1));
+	const int32 I = FMath::Min(FMath::FloorToInt(K), N - 2);
+	const float A = K - float(I);
+	OutPoint = GroundRootAt(At, Now) + Basis.TransformVector(FMath::Lerp(D.RegionPath[I], D.RegionPath[I + 1], A));
+	OutNormal = Basis.TransformVector(FMath::Lerp(D.RegionPathNormal[I], D.RegionPathNormal[I + 1], A)).GetSafeNormal();
+	return true;
+}
+
 bool UFootballSkillComponent::RequestSkill(UFootballSkillData* Skill, AActor* Ball, FVector InputDirection, bool bMirrored) {
-	ACharacter* Character = Cast<ACharacter>(GetOwner());
-	UAnimInstance* Anim = GetAnimInstance();
+	UFootballActionComponent* Actions = GetOwner()->FindComponentByClass<UFootballActionComponent>();
+	if (!Actions) {
+		UE_LOG(LogFootballSkill, Warning, TEXT("%s refused: the player needs a FootballAction component (master plan Phase 5)"), *GetNameSafe(Skill));
+		return false;
+	}
+	FActionContext Context;
+	Context.BallActor = Ball;
+	Context.InputDirection = InputDirection;
+	Context.bMirrored = bMirrored;
+	return Actions->RequestActionData(Skill, Context);
+}
+
+bool UFootballSkillComponent::PrepareSkill(const UFootballSkillData* Skill, const FActionContext& Context, const FSkillBasis& InBasis,
+	FActionAlignmentTarget& OutAlignment, bool& bOutReachable, FVector& OutTravel) const {
+	OutAlignment = FActionAlignmentTarget();
+	bOutReachable = true;
+	OutTravel = FVector::ZeroVector;
 	const FString SkillName = GetNameSafe(Skill);
-	if (ActiveSkill) {
-		UE_LOG(LogFootballSkill, Log, TEXT("%s refused: %s is still playing"), *SkillName, *ActiveSkill->GetName());
+	UAnimInstance* Anim = GetAnimInstance();
+	if (!Skill || !Cast<ACharacter>(GetOwner()) || !Anim) {
+		UE_LOG(LogFootballSkill, Warning, TEXT("%s can't play: no skill, or the owner is not a Character with an AnimBP"), *SkillName);
 		return false;
 	}
-	if (!Skill || !Character || !Anim) {
-		UE_LOG(LogFootballSkill, Warning, TEXT("%s refused: no skill, or the owner is not a Character with an AnimBP"), *SkillName);
-		return false;
-	}
-	if ((bMirrored && Skill->AllowedFeet == EFootSelection::Right) || (!bMirrored && Skill->AllowedFeet == EFootSelection::Left)) {
-		UE_LOG(LogFootballSkill, Log, TEXT("%s refused: not allowed with the %s foot"), *SkillName, bMirrored ? TEXT("left") : TEXT("right"));
-		return false;
-	}
-	UAnimMontage* NewMontage = Skill->GetMontage(bMirrored);
+	const UAnimMontage* NewMontage = Skill->GetMontage(Context.bMirrored);
 	if (!NewMontage || NewMontage->SlotAnimTracks.Num() == 0) {
-		UE_LOG(LogFootballSkill, Warning, TEXT("%s refused: no %s montage"), *SkillName, bMirrored ? TEXT("mirrored") : TEXT("right-foot"));
+		UE_LOG(LogFootballSkill, Warning, TEXT("%s can't play: no %s montage"), *SkillName, Context.bMirrored ? TEXT("mirrored") : TEXT("right-foot"));
 		return false;
 	}
 	const FName Slot = NewMontage->SlotAnimTracks[0].SlotName;
 	if (Anim->GetSlotNodeGlobalWeight(Slot) <= 0.f) {
-		UE_LOG(LogFootballSkill, Warning, TEXT("%s refused: the AnimBP %s has no active slot %s"), *SkillName, *Anim->GetClass()->GetName(), *Slot.ToString());
+		UE_LOG(LogFootballSkill, Warning, TEXT("%s can't play: the AnimBP %s has no active slot %s"), *SkillName, *Anim->GetClass()->GetName(), *Slot.ToString());
 		return false;
 	}
+	const FActionAlignmentProfile& Profile = Skill->AlignmentProfile;
+	const float Rate = FMath::Max(Skill->PlayRate * NewMontage->RateScale, UE_KINDA_SMALL_NUMBER);
+	const FVector EntryVelocity2D = Profile.bCarryEntryVelocity ? FVector(Context.PlayerVelocity.X, Context.PlayerVelocity.Y, 0.0) : FVector::ZeroVector;
+	const FVector2D Track0 = SampleTrackOf(*Skill, *NewMontage, 0.f);
+	const FVector2D TrackEnd = SampleTrackOf(*Skill, *NewMontage, NewMontage->GetPlayLength()) - Track0;
+	const TArray<FWindow> NewWindows = CollectWindows(*Skill, *NewMontage);
+	const UBallMovementComponent* Movement = Context.BallActor ? Context.BallActor->FindComponentByClass<UBallMovementComponent>() : nullptr;
+	const FBallContactDescriptor D = NewWindows.Num() > 0 ? Skill->GetTunedDescriptor(NewWindows[0].ContactIndex, Context.bMirrored) : FBallContactDescriptor();
+	// The whole move for the collision-space check: the travel, the entry momentum (held to the first contact, then its fade).
+	const float EntryHold = NewWindows.Num() > 0 ? D.ContactTime / Rate : 0.f;
+	OutTravel = InBasis.TransformVector(FVector(TrackEnd.X, TrackEnd.Y, 0.0)) + EntryVelocity2D * double(EntryHold + Profile.EntryDecayTime);
+	if (NewWindows.Num() == 0 || !Movement) {
+		return true; // no ball work, or no usable ball (the action layer's ValidateBall says so)
+	}
+	if (!Regions) {
+		UE_LOG(LogFootballSkill, Warning, TEXT("%s can't play: it needs PlayerBallInteraction on the player"), *SkillName);
+		return false;
+	}
+	if (D.ExpectedBallOffset.IsNearlyZero()) {
+		UE_LOG(LogFootballSkill, Warning, TEXT("%s: contact %d has no ExpectedBallOffset (re-run the bake) - it can't be reached"), *SkillName, NewWindows[0].ContactIndex);
+		bOutReachable = false;
+		return true;
+	}
+	// Spec §72-73: where the free ball will be at the planned touch, and where the expected spot would be by then.
+	FAlignmentQuery Query;
+	const float WarpStart = FMath::Min(Profile.WarpStartTime, D.ContactTime);
+	FVector BallVelocity;
+	Query.PredictedBall = Movement->PredictFreeBall(D.ContactTime / Rate, BallVelocity);
+	Query.Pivot = FVector(Context.PlayerLocation.X, Context.PlayerLocation.Y, Movement->GetGroundZ());
+	const FVector2D Travel = SampleTrackOf(*Skill, *NewMontage, D.ContactTime) - Track0;
+	Query.PredictedRoot = Query.Pivot + InBasis.TransformVector(FVector(Travel.X, Travel.Y, 0.0));
+	Query.EntryOffset = EntryVelocity2D * double(EntryHold);
+	Query.Basis = InBasis;
+	Query.ExpectedBallOffset = D.ExpectedBallOffset;
+	Query.Tolerance = D.ContactTolerance;
+	Query.TimeAvailable = (D.ContactTime - WarpStart) / Rate;
+	Query.WindowStart = WarpStart;
+	Query.WindowEnd = D.ContactTime;
+	Query.ContactIndex = NewWindows[0].ContactIndex;
+	Query.bAllowRotation = true;
+	Query.Profile = Profile;
+	if (!Profile.bAlignPlayer) {
+		// No player correction: the action only starts when the ball is already where its first contact expects it.
+		Query.Profile.MaxPositionCorrection = 0.f;
+		Query.Profile.MaxRotationCorrection = 0.f;
+	}
+	OutAlignment = UFootballActionComponent::CalculateAlignmentTarget(Query);
+	OutAlignment.TimeToContact = D.ContactTime / Rate;
+	OutTravel += OutAlignment.PositionCorrection;
+	bOutReachable = OutAlignment.bReachable;
+	return true;
+}
 
+bool UFootballSkillComponent::StartSkill(UFootballSkillData* Skill, const FActionContext& Context, const FSkillBasis& NewBasis, ESkillDirection Direction,
+	const FActionAlignmentTarget& InAlignment) {
+	ACharacter* Character = Cast<ACharacter>(GetOwner());
+	UAnimInstance* Anim = GetAnimInstance();
+	UAnimMontage* NewMontage = Skill ? Skill->GetMontage(Context.bMirrored) : nullptr;
+	if (ActiveSkill || !Skill || !Character || !Anim || !NewMontage) {
+		return false;
+	}
+	const FString SkillName = Skill->GetName();
+	const bool bMirrored = Context.bMirrored;
+	AActor* Ball = Context.BallActor;
 	TArray<FWindow> NewWindows = CollectWindows(*Skill, *NewMontage);
-	ESkillDirection Direction = ESkillDirection::Forward;
-	const FSkillBasis NewBasis = UBallContactResolver::MakeSkillBasisFromInput(Character->GetActorLocation(), Character->GetActorForwardVector(),
-		InputDirection, Skill->AllowedDirections, bMirrored, Direction);
 	UBallMovementComponent* Movement = Ball ? Ball->FindComponentByClass<UBallMovementComponent>() : nullptr;
 	UBallStateComponent* State = Ball ? Ball->FindComponentByClass<UBallStateComponent>() : nullptr;
-	if (NewWindows.Num() > 0) {
-		if (!Movement || !State || !Skill->TrajectoryProfile || !Regions) {
-			UE_LOG(LogFootballSkill, Warning, TEXT("%s refused: it needs a ball with BallMovement and BallState, a TrajectoryProfile, and PlayerBallInteraction on the player"), *SkillName);
-			return false;
-		}
-		const UPrimitiveComponent* Body = Cast<UPrimitiveComponent>(Ball->GetRootComponent());
-		const EBallState BallNow = State->GetState();
-		const AActor* BallOwner = State->GetBallOwner();
-		if (!Body || !Body->IsSimulatingPhysics() || !UBallStateComponent::IsTransitionAllowed(BallNow, EBallState::SkillControlled)
-			|| (BallOwner && BallOwner != Character && (BallNow == EBallState::Controlled || BallNow == EBallState::Receiving))) {
-			UE_LOG(LogFootballSkill, Log, TEXT("%s refused: the ball is %s (owner %s)"), *SkillName, *UEnum::GetValueAsString(BallNow), *GetNameSafe(BallOwner));
-			return false;
-		}
-		const double Distance = FVector::Dist2D(Ball->GetActorLocation(), Character->GetActorLocation());
-		if (Distance > Skill->MaxStartDistance) {
-			UE_LOG(LogFootballSkill, Log, TEXT("%s refused: the ball is %.0f cm away (max %.0f)"), *SkillName, Distance, Skill->MaxStartDistance);
-			return false;
-		}
-		// The ball has to be able to reach the first contact in time (the path is relative to the skill's start).
-		const FWindow& First = NewWindows[0];
-		const FVector2D Track0 = SampleTrackOf(*Skill, *NewMontage, 0.f);
-		const FVector Path = Skill->TrajectoryProfile->Evaluate(First.Start / FMath::Max(NewMontage->GetPlayLength(), UE_KINDA_SMALL_NUMBER));
-		const FVector FirstTarget = Character->GetActorLocation() + NewBasis.TransformVector(FVector(Path.X - Track0.X, Path.Y - Track0.Y, 0.0));
-		const double Gap = FVector::Dist2D(Ball->GetActorLocation(), FirstTarget);
-		const double Reach = Skill->MaxApproachSpeed * First.Start / FMath::Max(Skill->PlayRate * NewMontage->RateScale, UE_KINDA_SMALL_NUMBER)
-			+ Skill->GetTunedDescriptor(First.ContactIndex, bMirrored).ContactTolerance;
-		if (Gap > Reach) {
-			UE_LOG(LogFootballSkill, Log, TEXT("%s refused: the ball is %.0f cm from the first contact, only %.0f cm reachable in time"), *SkillName, Gap, Reach);
-			return false;
-		}
-	}
 
 	if (Anim->Montage_Play(NewMontage, Skill->PlayRate) <= 0.f) {
 		UE_LOG(LogFootballSkill, Warning, TEXT("%s refused: %s did not play"), *SkillName, *NewMontage->GetName());
@@ -254,7 +442,20 @@ bool UFootballSkillComponent::RequestSkill(UFootballSkillData* Skill, AActor* Ba
 	BallMovement = Movement;
 	BallStateComp = State;
 	BallContacts = Ball ? Ball->FindComponentByClass<UBallInteractionComponent>() : nullptr;
-	bApproaching = Windows.Num() > 0;
+	// The player is moved to the ball (spec §15); the ball is left to physics until the first touch, and stays the
+	// dribbler's (Controlled) until then.
+	bWantsBall = Windows.Num() > 0;
+	bAlign = bWantsBall && Skill->AlignmentProfile.bAlignPlayer;
+	Alignment = InAlignment;
+	bWarping = bAlign && !Alignment.PositionCorrection.IsNearlyZero();
+	WarpAlpha = 0.f;
+	AlignmentApplied = FVector::ZeroVector;
+	bEntryMomentum = Skill->AlignmentProfile.bCarryEntryVelocity;
+	EntryVelocity = FVector(Context.PlayerVelocity.X, Context.PlayerVelocity.Y, 0.0);
+	EntryHoldTime = bWantsBall ? Skill->GetTunedDescriptor(Windows[0].ContactIndex, bMirrored).ContactTime : 0.f;
+	EntryDecayTime = Skill->AlignmentProfile.EntryDecayTime;
+	bBallTakenAway = false;
+	HoldBallUntil = 0.0;
 	bOwned = false;
 	bEverTouched = false;
 	bReleased = false;
@@ -264,13 +465,16 @@ bool UFootballSkillComponent::RequestSkill(UFootballSkillData* Skill, AActor* Ba
 	UBallContactResolver::StopTracking(Tracker);
 	LastEvaluated = INDEX_NONE;
 	bTouchedThisTick = false;
-	LastTarget = Ball ? Ball->GetActorLocation() : FVector::ZeroVector;
+	LastTarget = Alignment.ContactIndex != INDEX_NONE ? Alignment.PredictedBall : (Ball ? Ball->GetActorLocation() : FVector::ZeroVector);
 	StartTime = GetWorld()->GetTimeSeconds();
 	TurnFrom = Character->GetActorQuat();
 	TurnTo = Basis.Forward.ToOrientationQuat();
 	TurnDuration = NewMontage->BlendIn.GetBlendTime();
 	bTurning = true;
 	Character->GetCharacterMovement()->StopMovementImmediately();
+	// The input already queued this frame would still move the capsule once, by a frame-length-dependent amount (master plan
+	// 6.7: 1.5 cm more at 30 fps than at 60, which moved the elastico's touches).
+	Character->ConsumeMovementInputVector();
 	if (AController* Controller = Character->GetController()) {
 		Controller->SetIgnoreMoveInput(true); // undone in Finish
 		IgnoredController = Controller;
@@ -286,13 +490,16 @@ bool UFootballSkillComponent::RequestSkill(UFootballSkillData* Skill, AActor* Ba
 }
 
 bool UFootballSkillComponent::RequestSkillByTag(FGameplayTag SkillTag, AActor* Ball, FVector InputDirection, bool bMirrored) {
-	for (UFootballSkillData* Skill : LoadedSkills) {
-		if (Skill && Skill->SkillTag == SkillTag) {
-			return RequestSkill(Skill, Ball, InputDirection, bMirrored);
-		}
+	UFootballActionComponent* Actions = GetOwner()->FindComponentByClass<UFootballActionComponent>();
+	if (!Actions) {
+		UE_LOG(LogFootballSkill, Warning, TEXT("%s refused: the player needs a FootballAction component (master plan Phase 5)"), *SkillTag.ToString());
+		return false;
 	}
-	UE_LOG(LogFootballSkill, Log, TEXT("No skill tagged %s in %s"), *SkillTag.ToString(), *SkillDirectory.Path);
-	return false;
+	return Actions->RequestActionWithInput(SkillTag, Ball, InputDirection, bMirrored);
+}
+
+bool UFootballSkillComponent::IsSkillUsingBall() const {
+	return (ActiveSkill != nullptr && Windows.Num() > 0) || (HoldBallUntil > 0.0 && GetWorld() && GetWorld()->GetTimeSeconds() < HoldBallUntil);
 }
 
 void UFootballSkillComponent::CancelSkill() {
@@ -331,6 +538,8 @@ void UFootballSkillComponent::TickComponent(float DeltaTime, ELevelTick TickType
 	const float T = Instance->GetPosition();
 	UpdateTurn();
 	ApplyTravel(T);
+	ApplyAlignment(T);
+	ApplyEntryMomentum(T);
 	if (const ACharacter* Character = Cast<ACharacter>(GetOwner())) {
 		Character->GetCharacterMovement()->StopMovementImmediately();
 	}
@@ -348,9 +557,11 @@ void UFootballSkillComponent::UpdateBall(float T, float DeltaTime) {
 	if (Windows.Num() == 0 || !BallMovement || !BallStateComp || !ActiveBall) {
 		return;
 	}
-	// Taken away by someone or something else (a tackle, a kick, a reset): the move carries on without it.
+	// Taken away by someone or something else (a tackle, a kick, a reset): the action layer ends the move (spec §65 BallLost)
+	// unless the action plays on without it.
 	if (bOwned && (BallStateComp->GetState() != EBallState::SkillControlled || BallStateComp->GetBallOwner() != GetOwner())) {
 		bOwned = false;
+		bBallTakenAway = true;
 	}
 	for (FWindow& Window : Windows) {
 		if (Window.Phase == EWindowPhase::Pending && T >= Window.Start) {
@@ -370,7 +581,7 @@ void UFootballSkillComponent::UpdateBall(float T, float DeltaTime) {
 		FWindow& Window = Windows[i];
 		if (Window.Phase == EWindowPhase::Open) {
 			// A collision happens once; a carry keeps pushing every tick the body is on the ball.
-			if (!Window.bTouched || IsCarry(ActiveSkill->ContactDescriptors[Window.ContactIndex].ContactType)) {
+			if (!Window.bTouched || IsCarry(ActiveSkill->ContactDescriptors[Window.ContactIndex].ResponseMode)) {
 				EvaluateWindow(i, T, DeltaTime);
 			}
 			if (T >= Window.End) {
@@ -378,9 +589,6 @@ void UFootballSkillComponent::UpdateBall(float T, float DeltaTime) {
 				Window.Phase = EWindowPhase::Done;
 			}
 		}
-	}
-	if (bApproaching) {
-		LegacyApproach(T, DeltaTime);
 	}
 }
 
@@ -398,7 +606,7 @@ void UFootballSkillComponent::TrackContactRegion(int32 Index, float DeltaTime) {
 }
 
 void UFootballSkillComponent::EvaluateWindow(int32 Index, float T, float DeltaTime) {
-	if (!bApproaching && !bOwned) {
+	if (!bWantsBall && !bOwned) {
 		return; // the skill no longer has the ball (missed, taken away)
 	}
 	FWindow& Window = Windows[Index];
@@ -411,66 +619,192 @@ void UFootballSkillComponent::EvaluateWindow(int32 Index, float T, float DeltaTi
 	const FBallContactDescriptor D = ActiveSkill->GetTunedDescriptor(Window.ContactIndex, bActiveMirrored);
 	const FVector Ball = ActiveBall->GetActorLocation();
 	const double Radius = BallMovement->GetBallRadius();
-	// Where the body region has to be for this touch (the resolver's T1 turned round), and the point of the region's
-	// path this tick closest to it: a fast foot moves several cm a tick and must not skip past the ball.
-	const FVector Needed = Ball + UBallContactResolver::RegionDirection(D.BallContactRegion, Basis) * Radius - Basis.TransformVector(D.LocalBallOffset);
-	const FVector From = Tracker.Point - Tracker.Velocity * DeltaTime;
-	const FVector Path = Tracker.Point - From;
-	const double Along = Path.SizeSquared() > UE_KINDA_SMALL_NUMBER ? FMath::Clamp(FVector::DotProduct(Needed - From, Path) / Path.SizeSquared(), 0.0, 1.0) : 1.0;
+	const FVector BallVelocity = BallMovement->GetBallVelocity();
+	// Spec §11 (master plan 2.3 / 6.4): the region's path this tick swept against the ball decides the touch - the two
+	// really meet, no tolerance (§164). The resolver's other tests still apply at the moment they meet: the ball on the
+	// side the region faces (T4), the body closing on it (T2) and the body's minimum speed (T5).
+	const FBodyRegionRow* Row = Regions->GetRegionRow(D.BodyContactRegion);
 	FContactQuery Query;
-	Query.BallCenter = Ball;
-	Query.BallVelocity = BallMovement->GetBallVelocity();
+	Query.BallVelocity = BallVelocity;
 	Query.BallRadius = float(Radius);
-	Query.BodyPoint = From + Path * Along;
-	Query.BodyNormal = Tracker.Normal;
-	Query.BodyVelocity = Tracker.Velocity;
 	Query.PlayerVelocity = TrackVelocity(T);
 	Query.Descriptor = D;
+	Query.Descriptor.ContactTolerance = UE_BIG_NUMBER; // the sweep is the distance test
 	Query.Basis = Basis;
 	Query.bWindowOpen = true;
-	Window.Result = UBallContactResolver::ResolveContact(Query);
-	// The generic sweep of the region against the ball itself (spec §11), for fb.Debug.Contact; the frozen skill still
-	// decides with the check above until Phase 6 switches it over.
-	const FBodyRegionRow* Row = Regions->GetRegionRow(D.BodyContactRegion);
-	UBallContactResolver::SweepRegionToBall(Tracker.Point, Tracker.Velocity, Row ? Row->Radius : 0.f, Ball, Query.BallVelocity, Query.BallRadius,
-		DeltaTime, Window.Result.ClosestApproach, Window.Result.SweepAlpha, Window.Result.ContactPoint);
-	if (Window.Result.Validation == EContactValidation::Valid) {
-		Touch(Index, T);
+	// One moment of the sweep: the resolver at the region and the ball then (Gap > 0 = they don't meet). True = touched.
+	const auto Candidate = [&](const FVector& BodyPoint, const FVector& BodyNormal, const FVector& BodyVelocity, const FVector& BallAt, float Gap,
+		float Alpha) {
+		Query.BallCenter = BallAt;
+		Query.BodyPoint = BodyPoint;
+		Query.BodyNormal = BodyNormal;
+		Query.BodyVelocity = BodyVelocity;
+		Window.Result = UBallContactResolver::ResolveContact(Query);
+		Window.Result.ClosestApproach = Gap;
+		Window.Result.SweepAlpha = Alpha;
+		Window.Result.ContactPoint = BallAt + (BodyPoint - BallAt).GetSafeNormal() * Radius;
+		if (Gap > 0.f && Window.Result.Validation == EContactValidation::Valid) {
+			Window.Result.Validation = EContactValidation::TooFar;
+		}
+		if (Window.Result.Validation != EContactValidation::Valid) {
+			return false;
+		}
+		const bool bWasTouched = Window.bTouched;
+		Touch(Index, T, BallAt, BodyVelocity);
+		return Window.bTouched && (!bWasTouched || IsCarry(D.ResponseMode)); // Touch still refuses a ball not closing on the body
+	};
+	FVector P, N;
+	if (!BakedRegionAt(D, T, T, P, N)) {
+		// No baked path: the live region, swept along its chord this tick.
+		float Gap = UE_BIG_NUMBER, Alpha = 1.f;
+		FVector ContactPoint;
+		UBallContactResolver::SweepRegionToBall(Tracker.Point, Tracker.Velocity, Row ? Row->Radius : 0.f, Ball, BallVelocity, float(Radius), DeltaTime,
+			Gap, Alpha, ContactPoint);
+		const double Back = double(DeltaTime) * (1.0 - Alpha); // to where the touch starts
+		Candidate(Tracker.Point - Tracker.Velocity * Back, Tracker.Normal, Tracker.Velocity, Ball - BallVelocity * Back, Gap, Alpha);
+		return;
 	}
+	// Master plan 6.7: the baked path at fixed moments of montage time - a 1/240 s grid, the window's ends, and where the region
+	// first meets the ball (bisected between grid points) - from the last tick to now: the same touch at any frame rate. The
+	// ball rolls straight within the tick.
+	const double Rate = GetPlayRate();
+	const float From = FMath::Max(LastMontageTime, Window.Start), To = FMath::Min(T, Window.End);
+	const double Reach = Radius + (Row ? Row->Radius : 0.f);
+	const float Grid = float(Rate / 240.0);
+	FVector B;
+	const auto GapAt = [&](float S) { // sets P, N, B to moment S
+		BakedRegionAt(D, S, T, P, N);
+		B = Ball - BallVelocity * (double(T - S) / Rate);
+		return float(FVector::Dist(P, B) - Reach);
+	};
+	const auto TryAt = [&](float S, float G) { // the resolver at moment S, after GapAt(S)
+		const FVector Point = P, Normal = N, BallAt = B;
+		FVector Before, Unused;
+		BakedRegionAt(D, S - float(Rate / 480.0), T, Before, Unused);
+		return Candidate(Point, Normal, (Point - Before) * 480.0, BallAt, G, To > From ? (S - From) / (To - From) : 1.f);
+	};
+	// This tick takes the grid points after From up to To (by index, so ticks tile the grid without gaps), plus the window's
+	// end if it falls in this tick; the one at or before From brackets a meeting that starts now (the last tick tested it).
+	const int32 J0 = FMath::FloorToInt(From / Grid), J1 = FMath::FloorToInt(To / Grid);
+	const bool bWindowEnds = T >= Window.End;
+	float PrevS = FMath::Max(float(J0) * Grid, Window.Start);
+	float PrevG = GapAt(PrevS);
+	if (PrevG <= 0.f && LastMontageTime < Window.Start && TryAt(PrevS, PrevG)) {
+		return; // on the ball as the window opens
+	}
+	float BestS = PrevS, BestG = PrevG;
+	for (int32 J = J0 + 1; J <= J1 + (bWindowEnds ? 1 : 0); ++J) {
+		const float S = J > J1 ? Window.End : float(J) * Grid;
+		if (S <= PrevS) {
+			continue; // the window's end on the last grid point
+		}
+		const float G = GapAt(S);
+		if (G < BestG) {
+			BestS = S;
+			BestG = G;
+		}
+		if (G <= 0.f) {
+			if (PrevG > 0.f) {
+				float Lo = PrevS, Hi = S;
+				for (int32 i = 0; i < 12; ++i) {
+					const float Mid = 0.5f * (Lo + Hi);
+					if (GapAt(Mid) > 0.f) {
+						Lo = Mid;
+					} else {
+						Hi = Mid;
+					}
+				}
+				if (TryAt(Hi, GapAt(Hi))) {
+					return; // where they first meet
+				}
+				GapAt(S);
+			}
+			if (TryAt(S, G)) {
+				return;
+			}
+		}
+		PrevS = S;
+		PrevG = G;
+	}
+	TryAt(BestS, GapAt(BestS)); // no touch this tick: the record shows the closest moment
 }
 
-void UFootballSkillComponent::Touch(int32 Index, float T) {
+void UFootballSkillComponent::Touch(int32 Index, float T, const FVector& BallCenter, const FVector& BodyVelocity) {
 	FWindow& Window = Windows[Index];
 	const bool bFirstContact = !Window.bTouched;
-	Window.bTouched = true;
 	const FBallContactDescriptor D = ActiveSkill->GetTunedDescriptor(Window.ContactIndex, bActiveMirrored);
 	const double Radius = BallMovement->GetBallRadius();
-	const FVector BallVelocity = BallMovement->GetBallVelocity();
-	FVector Physical, Needed, Applied, Spin;
-	bool bLeaves = false;
-	if (IsCarry(D.ContactType)) {
-		// A carry: while the body pushes, the ball goes with it (no bounce, full grip). It separates by itself when the
-		// body stops pushing (the check's T2 fails from then on), and the end of the window lets it go.
-		Physical = Needed = Applied = LegacyCarryVelocity(Window, BallVelocity, Radius);
-	} else {
-		// One collision of the ball with the moving body region (doc §19), from the contact's real geometry...
-		const FBodyRegionRow* Row = Regions->GetRegionRow(D.BodyContactRegion);
-		const UPrimitiveComponent* Body = Cast<UPrimitiveComponent>(ActiveBall->GetRootComponent());
-		Physical = UBallContactResolver::ComputeDeflection(BallVelocity, Tracker.Velocity, Window.Result.ContactNormal,
-			Row ? Row->Restitution : 0.5f, Row ? Row->TangentDamping : 0.2f, Body ? Body->GetPhysicsAngularVelocityInDegrees() : FVector::ZeroVector,
-			Row ? Row->SpinTransfer : 0.f, float(Radius), Spin);
-		// ...moved toward what the skill needs: the next touch's spot in time, or after the last one the authored exit (doc §20).
-		bLeaves = !Windows.IsValidIndex(Index + 1);
-		Applied = LegacyAim(Index, T, D, Physical, BallVelocity, bLeaves, Needed);
+	FVector BallVelocity = BallMovement->GetBallVelocity(), SpinDeg = FVector::ZeroVector;
+	if (BallContacts) {
+		BallContacts->GetPendingMotion(BallVelocity, SpinDeg); // this frame's queued response included
 	}
-	// Rolling spin, so the ball rolls off the touch instead of skidding (a skid would lose ~2/7 of the speed).
-	const FVector Roll = FMath::RadiansToDegrees(FVector::CrossProduct(FVector::UpVector, FVector(Applied.X, Applied.Y, 0.0)) / FMath::Max(Radius, 1.0));
+	const UPrimitiveComponent* BallBody = Cast<UPrimitiveComponent>(ActiveBall->GetRootComponent());
+	const bool bBodyOk = BallBody && BallBody->IsSimulatingPhysics();
+	const double Mass = bBodyOk ? FMath::Max(double(BallBody->GetMass()), 0.01) : 0.43;
+	const bool bCarry = IsCarry(D.ResponseMode);
+	const bool bLeaves = !bCarry && !Windows.IsValidIndex(Index + 1);
+	// Spec §122 / §7: one raw collision of the ball with the moving body region, at the swept contact point (or, for a
+	// carry, an inelastic push that grips).
+	const FBodyRegionRow* Row = Regions->GetRegionRow(D.BodyContactRegion);
+	const FActionBallResponseProfile& Surface = ActiveSkill->BallResponseProfile;
+	FBallResponseInput In;
+	In.Mode = bCarry ? EBallResponseMode::PhysicalRedirect : D.ResponseMode;
+	In.BallCenter = BallCenter;
+	In.BallVelocity = BallVelocity;
+	In.BallAngularVelocity = FMath::DegreesToRadians(SpinDeg);
+	In.BallRadius = float(Radius);
+	In.BallMass = float(Mass);
+	In.InertiaFactor = bBodyOk ? float(BallBody->GetInertiaTensor().X / (Mass * Radius * Radius)) : 0.667f;
+	const FVector Normal = (In.BallCenter - Window.Result.ContactPoint).GetSafeNormal();
+	In.ContactNormal = Normal.IsNearlyZero() ? Window.Result.ContactNormal : Normal;
+	In.ContactPoint = In.BallCenter - In.ContactNormal * Radius;
+	In.BodyVelocity = BodyVelocity;
+	In.Restitution = bCarry ? 0.f : (D.Restitution >= 0.f ? D.Restitution : (Row ? Row->Restitution : 0.5f)) * Surface.RestitutionScale;
+	In.Friction = bCarry ? 10.f : (D.TangentialGrip >= 0.f ? D.TangentialGrip : DefaultFriction) * Surface.FrictionScale;
+	In.ContactStrength = Surface.ContactStrength;
+	const FBallResponse Raw = UBallPhysicsResponse::ComputeResponse(In);
+	if (!bCarry && !Raw.bContact) {
+		// The ball's surface isn't closing on the body after all (its spin, a low contact): no touch, so no assist either;
+		// the window stays open.
+		Window.Result.Validation = EContactValidation::WrongDirection;
+		return;
+	}
+	Window.bTouched = true;
+	FVector Physical = Raw.bContact ? Raw.VelocityAfter : BallVelocity;
+	FVector Spin = Raw.bContact ? Raw.AngularVelocityAfter : In.BallAngularVelocity; // rad/s
+	// A grounded ball that isn't lifted leaves the touch rolling: ground friction takes its skid at once, so the rolling
+	// predictions and the intent hold (master plan 6.4: left to skid, the elastico's outside touch lost ~70% of its
+	// sideways speed and the inside touch missed).
+	const bool bRolls = BallMovement->IsGrounded() && Physical.Z < MaxRollingLift;
+	if (bRolls) {
+		Physical = UBallPhysicsResponse::RollingVelocity(Physical, Spin, In.BallRadius, In.InertiaFactor);
+	}
+	// Spec §14: bounded assist toward the intent - the next contact's spot in time, or after the last contact its exit.
+	FVector Needed = Physical, Applied = Physical;
+	if (!bCarry) {
+		Needed = bLeaves ? Basis.TransformVector(D.PreferredDirection).GetSafeNormal() * double(D.PreferredSpeed)
+			: IntentToward(Index + 1, T, ActiveBall->GetActorLocation()); // from where the new velocity starts (this tick's end)
+		const FActionAssistProfile& AssistProfile = ActiveSkill->AssistProfile;
+		FBallAssistInput Assist;
+		Assist.RawVelocity = Physical;
+		Assist.IntendedDirection = Needed.GetSafeNormal();
+		Assist.IntendedSpeed = float(Needed.Size());
+		Assist.Strength = D.AssistStrength * AssistProfile.StrengthScale;
+		Assist.MaxAngleDegrees = D.MaxAssistAngleDegrees * AssistProfile.BoundsScale;
+		Assist.MaxSpeedChange = D.MaxAssistSpeed * AssistProfile.BoundsScale;
+		Assist.bArcade = D.bArcadeAssist;
+		Applied = UBallAssist::BoundedBlend(ScaleAssistForPlayer(Assist)).Velocity;
+	}
+	if (bRolls) {
+		Applied.Z = 0.0;
+		Spin = FVector::CrossProduct(FVector::UpVector, Applied) / Radius + FVector(0.0, 0.0, Spin.Z); // rolling, its twist kept
+	}
 	if (BallContacts) {
 		BallContacts->TryClaim(EContactPriority::Skill, GetOwner());
 	}
 	const EBallState NewState = bLeaves ? (BallMovement->IsGrounded() ? EBallState::Free : EBallState::Airborne) : EBallState::SkillControlled;
-	BallMovement->ApplyTouch(Applied, Roll, NewState, bLeaves ? nullptr : GetOwner());
-	bApproaching = false;
+	BallMovement->ApplyTouch(Applied, FMath::RadiansToDegrees(Spin), NewState, bLeaves ? nullptr : GetOwner());
+	bWantsBall = false;
 	bEverTouched = true;
 	bOwned = !bLeaves;
 	bReleased = bReleased || bLeaves;
@@ -478,8 +812,11 @@ void UFootballSkillComponent::Touch(int32 Index, float T) {
 	TouchPhysical = Physical;
 	TouchNeeded = Needed;
 	TouchApplied = Applied;
-	LastTarget = bLeaves || IsCarry(D.ContactType) ? ActiveBall->GetActorLocation() + Applied * 0.25
-		: LegacyTrajectoryTarget(ActiveSkill->GetTunedDescriptor(Windows[Index + 1].ContactIndex, bActiveMirrored).ContactTime);
+	TouchImpulse = (Applied - BallVelocity) * Mass;
+	if (bAlign && bFirstContact && !bLeaves && Windows.IsValidIndex(Index + 1) && ActiveSkill->AlignmentProfile.bRealignBeforeEachContact) {
+		Realign(Index + 1, T);
+	}
+	LastTarget = (bLeaves || bCarry || !Windows.IsValidIndex(Index + 1)) ? In.BallCenter + Applied * 0.25 : PredictContactSpot(Index + 1, T);
 	if (bFirstContact && CVarFootballDebugContacts.GetValueOnGameThread() != 0) {
 		// What the collision gave (orange), what the skill needed (cyan) and what the ball got (green), for 1.5 s.
 		const FVector From = ActiveBall->GetActorLocation();
@@ -492,8 +829,8 @@ void UFootballSkillComponent::Touch(int32 Index, float T) {
 void UFootballSkillComponent::CloseWindow(int32 Index) {
 	const FWindow& Window = Windows[Index];
 	if (Window.bTouched) {
-		const EContactType Type = ActiveSkill->ContactDescriptors[Window.ContactIndex].ContactType;
-		if (bOwned && IsCarry(Type) && (Type == EContactType::Release || Index == Windows.Num() - 1)) {
+		const FBallContactDescriptor& Desc = ActiveSkill->ContactDescriptors[Window.ContactIndex];
+		if (bOwned && IsCarry(Desc.ResponseMode) && (Desc.ContactType == EContactType::Release || Desc.bReleaseAfterContact || Index == Windows.Num() - 1)) {
 			// The carry ends: the ball leaves the skill with the velocity the body gave it.
 			LetGo();
 			bReleased = true;
@@ -502,12 +839,12 @@ void UFootballSkillComponent::CloseWindow(int32 Index) {
 		}
 		return;
 	}
-	if (bApproaching && Index == 0) {
+	if (bWantsBall && Index == 0) {
 		// The first touch never happened (out of reach, blocked, deflected): the move carries on without the ball.
-		bApproaching = false;
+		bWantsBall = false;
 		BallMovement->EndDribble(GetOwner());
-		UE_LOG(LogFootballSkill, Log, TEXT("%s: touch %d missed (%s, %.1f cm), carrying on without the ball"), *ActiveSkill->GetName(),
-			Window.ContactIndex, *UEnum::GetValueAsString(Window.Result.Validation), Window.Result.Distance);
+		UE_LOG(LogFootballSkill, Log, TEXT("%s: touch %d missed (%s, the foot passed %.1f cm off the ball), carrying on without the ball"),
+			*ActiveSkill->GetName(), Window.ContactIndex, *UEnum::GetValueAsString(Window.Result.Validation), FMath::Max(Window.Result.ClosestApproach, 0.f));
 	} else if (bOwned && Index == Windows.Num() - 1) {
 		UE_LOG(LogFootballSkill, Log, TEXT("%s: last touch missed (%s, %.1f cm), the ball rolls on"), *ActiveSkill->GetName(),
 			*UEnum::GetValueAsString(Window.Result.Validation), Window.Result.Distance);
@@ -526,7 +863,7 @@ void UFootballSkillComponent::UpdateSkillState() {
 	// Between touches the ball is on its way to the next one: Redirecting (doc §11, §18).
 	ESkillState New = bEverTouched ? ESkillState::Redirecting : ESkillState::Starting;
 	const FWindow* Open = Windows.FindByPredicate([this](const FWindow& W) {
-		return W.Phase == EWindowPhase::Open && (!W.bTouched || IsCarry(ActiveSkill->ContactDescriptors[W.ContactIndex].ContactType));
+		return W.Phase == EWindowPhase::Open && (!W.bTouched || IsCarry(ActiveSkill->ContactDescriptors[W.ContactIndex].ResponseMode));
 	});
 	if (bReleased || (Windows.Num() > 0 && Windows.Last().Phase == EWindowPhase::Done)) {
 		New = ESkillState::Recovering;
@@ -572,10 +909,14 @@ void UFootballSkillComponent::Finish(bool bCancelled) {
 	if (bOwned) {
 		LetGo();
 	}
-	if (bApproaching) {
+	if (bWantsBall) {
 		BallMovement->EndDribble(GetOwner());
 	}
-	bApproaching = false;
+	bWantsBall = false;
+	bWarping = false;
+	bEntryMomentum = false;
+	// Recovery (FActionRecoveryProfile): the normal control stays off the ball a little longer if the skill asks.
+	HoldBallUntil = Ended->RecoveryProfile.ResumeControlDelay > 0.f ? GetWorld()->GetTimeSeconds() + Ended->RecoveryProfile.ResumeControlDelay : 0.0;
 	if (AController* Controller = IgnoredController.Get()) {
 		Controller->SetIgnoreMoveInput(false);
 	}
@@ -597,7 +938,7 @@ void UFootballSkillComponent::RecordSample(float T) {
 	Sample.Time = float(GetWorld()->GetTimeSeconds() - StartTime);
 	Sample.MontageTime = T;
 	Sample.SkillState = SkillState;
-	Sample.bBallDriven = bApproaching || bOwned;
+	Sample.bBallDriven = bOwned;
 	if (BallStateComp) {
 		Sample.BallState = BallStateComp->GetState();
 	}
@@ -614,12 +955,16 @@ void UFootballSkillComponent::RecordSample(float T) {
 		Sample.ContactDistance = Window.Result.Distance;
 		Sample.BodyPoint = Window.Result.BodyPoint;
 		Sample.SurfacePoint = Window.Result.SurfacePoint;
+		Sample.ContactNormal = Window.Result.ContactNormal;
+		Sample.BodyVelocity = Tracker.Velocity;
 	}
 	Sample.TargetPos = LastTarget;
+	Sample.AlignmentApplied = AlignmentApplied;
 	if (bTouchedThisTick) {
 		Sample.TouchPhysical = TouchPhysical;
 		Sample.TouchNeeded = TouchNeeded;
 		Sample.TouchApplied = TouchApplied;
+		Sample.TouchImpulse = TouchImpulse;
 		bTouchedThisTick = false;
 	}
 	Sample.ActorPos = GetOwner()->GetActorLocation();
@@ -643,7 +988,7 @@ void UFootballSkillComponent::DrawDebug(float T) const {
 		const float Radius = BallMovement->GetBallRadius();
 		DrawDebugSphere(World, Center, Radius, 12, FColor::White);
 		DrawDebugDirectionalArrow(World, Center, Center + BallMovement->GetBallVelocity() * 0.1, 8.f, FColor::Yellow);
-		if (bApproaching || bOwned) {
+		if (bWantsBall || bOwned) {
 			DrawDebugSphere(World, LastTarget, Radius, 12, FColor::Green);
 		}
 	}
@@ -670,63 +1015,7 @@ void UFootballSkillComponent::DrawDebug(float T) const {
 			Window.Label.IsNone() ? TEXT("") : *Window.Label.ToString(), *UEnum::GetDisplayValueAsText(D.BodyContactRegion).ToString(),
 			*UEnum::GetDisplayValueAsText(Result.Validation).ToString(), Result.Distance, Result.ClosestApproach);
 	}
-	const FString Text = FString::Printf(TEXT("%s  %s  ball %s  t=%.2f%s"), *ActiveSkill->SkillTag.ToString(), *UEnum::GetDisplayValueAsText(SkillState).ToString(),
+	const FString Text = FString::Printf(TEXT("%s  %s  ball %s  t=%.2f%s"), *ActiveSkill->ActionTag.ToString(), *UEnum::GetDisplayValueAsText(SkillState).ToString(),
 		BallStateComp ? *UEnum::GetDisplayValueAsText(BallStateComp->GetState()).ToString() : TEXT("-"), T, *ContactText);
 	DrawDebugString(World, GetOwner()->GetActorLocation() + FVector(0.0, 0.0, 120.0), Text, nullptr, FColor::White, 0.f);
-}
-
-
-// ---- LEGACY ball-trajectory authority: frozen in master plan Phase 1 (2026-10-06), deleted in Phase 6 ----------------
-// The master spec forbids it (§15, §138, §171): see the header. Bodies unchanged from P3; Phase 6 replaces them with
-// player alignment, a raw physical impulse and bounded assist.
-
-FVector UFootballSkillComponent::LegacyTrajectoryTarget(float T) const {
-	// PrevTrack is the baked travel so far (ApplyTravel has run this tick). Unblocked, GroundRoot = start + that travel, so
-	// the two cancel exactly and the target is the authored path, whatever either curve's interpolation.
-	const FVector Path = ActiveSkill->TrajectoryProfile->Evaluate(T / MontageLength);
-	return GroundRoot() + Basis.TransformVector(FVector(Path.X - PrevTrack.X, Path.Y - PrevTrack.Y, Path.Z));
-}
-
-FVector UFootballSkillComponent::LegacyNeededVelocity(int32 NextIndex, float T) const {
-	// A freely rolling ball covers x(t) = v0 (1 - e^(-k t)) / k, so to cover d in t: v0 = k d / (1 - e^(-k t)).
-	const FBallContactDescriptor Next = ActiveSkill->GetTunedDescriptor(Windows[NextIndex].ContactIndex, bActiveMirrored);
-	const FVector Spot = LegacyTrajectoryTarget(Next.ContactTime);
-	const FVector Ball = ActiveBall->GetActorLocation();
-	const FVector Delta(Spot.X - Ball.X, Spot.Y - Ball.Y, 0.0);
-	const double Time = FMath::Max((Next.ContactTime - T) / GetPlayRate(), 0.05);
-	const double K = FMath::Max(double(BallRollDecay), 0.01);
-	return Delta * (K / (1.0 - FMath::Exp(-K * Time)));
-}
-
-FVector UFootballSkillComponent::LegacyAim(int32 Index, float T, const FBallContactDescriptor& D, const FVector& Physical, const FVector& BallVelocity,
-	bool bLeaves, FVector& OutNeeded) const {
-	OutNeeded = bLeaves ? UBallContactResolver::ComputeExitVelocity(D, Basis, TrackVelocity(T), BallVelocity) : LegacyNeededVelocity(Index + 1, T);
-	return Physical + (OutNeeded - Physical) * FMath::Clamp(D.AssistStrength, 0.f, 1.f);
-}
-
-FVector UFootballSkillComponent::LegacyCarryVelocity(const FWindow& Window, const FVector& BallVelocity, double Radius) const {
-	FVector Spin;
-	return UBallContactResolver::ComputeDeflection(BallVelocity, Tracker.Velocity, Window.Result.ContactNormal, 0.f, 1.f,
-		FVector::ZeroVector, 0.f, float(Radius), Spin);
-}
-
-void UFootballSkillComponent::LegacyApproach(float T, float DeltaTime) {
-	// Approach (doc §18): a physics ball, steered to come to rest on the first touch's spot when its window opens:
-	// time-to-go control from its own motion (a = 6 x / t^2 - 4 v / t: arrive at x with zero speed in t), so it
-	// decelerates onto the spot instead of overshooting it; from MinApproachTime before the window, held there.
-	const FWindow& First = Windows[0];
-	LastTarget = LegacyTrajectoryTarget(ActiveSkill->GetTunedDescriptor(First.ContactIndex, bActiveMirrored).ContactTime);
-	if (BallContacts && !BallContacts->TryClaim(EContactPriority::Skill, GetOwner())) {
-		return;
-	}
-	const FVector Ball = ActiveBall->GetActorLocation();
-	const FVector Velocity = BallMovement->GetBallVelocity();
-	const FVector ToSpot(LastTarget.X - Ball.X, LastTarget.Y - Ball.Y, 0.0);
-	const FVector Flat(Velocity.X, Velocity.Y, 0.0);
-	const double TimeToGo = (First.Start - T) / GetPlayRate();
-	const FVector Desired = TimeToGo > MinApproachTime
-		? Flat + (ToSpot * (6.0 / (TimeToGo * TimeToGo)) - Flat * (4.0 / TimeToGo)) * DeltaTime
-		: ToSpot / FMath::Max(double(MinApproachTime), 0.01);
-	// ApplyDribble with no spring and full blend sets exactly this velocity (capped, keeping the ball's own vertical motion).
-	BallMovement->ApplyDribble(GetOwner(), LastTarget, Desired, 0.f, ActiveSkill->MaxApproachSpeed, 1.f);
 }
