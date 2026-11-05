@@ -21,4 +21,10 @@ public:
 	// No impulse when the ball is not closing on the surface, and none for ControlledContact / Capture (not impulses).
 	UFUNCTION(BlueprintPure, Category = "Football|Response")
 	static FBallResponse ComputeResponse(const FBallResponseInput& Input);
+
+	// What ground friction leaves of a grounded ball's motion once its skid is gone: it rolls, its angular momentum about
+	// the ground contact kept - (v - k r (up x w)) / (1 + k) on the ground plane, k = InertiaFactor, w in rad/s. A rolling
+	// ball keeps its velocity; one sliding without spin keeps 1 / (1 + k) of it (0.6 for the real ball).
+	UFUNCTION(BlueprintPure, Category = "Football|Response")
+	static FVector RollingVelocity(FVector Velocity, FVector AngularVelocity, float Radius, float InertiaFactor);
 };

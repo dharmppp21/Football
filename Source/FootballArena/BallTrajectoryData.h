@@ -7,13 +7,12 @@
 #include "BallTrajectoryData.generated.h"
 
 // A skill's ball path (DA_BallTrajectory, doc §13–§14). The curves give the ball centre relative to the ground point
-// where the skill started, in skill space, at normalized skill time T (0..1 over the montage). At runtime the player's
-// baked travel is swapped for where the player really is, so a blocked player keeps the ball with them:
+// where the skill started, in skill space, at normalized skill time T (0..1 over the montage):
 //   LocalOffset = (ForwardCurve(T) * ForwardAmount, LateralCurve(T) * LateralAmount, VerticalCurve(T) * VerticalAmount)
 // SpeedCurve, if it has keys, remaps T first (timing changes without touching the path). Samples are the baked data
 // (Tools/prep_skill_anims.py); RebuildCurvesFromSamples turns them into the curves, which can then be tuned by hand.
-// Allowed uses (master spec §138): editor visualization, prediction, reachability and QA. Steering the ball by it at
-// runtime is legacy (UFootballSkillComponent's Legacy* functions, deleted in master plan Phase 6).
+// Allowed uses (master spec §138): editor visualization, prediction, reachability and QA - never steering the ball at
+// runtime (the frozen Elastico's steering by it was deleted in master plan Phase 6).
 UCLASS(BlueprintType)
 class FOOTBALLARENA_API UBallTrajectoryData : public UDataAsset {
 	GENERATED_BODY()

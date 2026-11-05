@@ -50,3 +50,9 @@ FBallResponse UBallPhysicsResponse::ComputeResponse(const FBallResponseInput& In
 	Out.AngularVelocityAfter = In.BallAngularVelocity + Out.AngularImpulse * InvInertia;
 	return Out;
 }
+
+FVector UBallPhysicsResponse::RollingVelocity(FVector Velocity, FVector AngularVelocity, float Radius, float InertiaFactor) {
+	const double K = FMath::Max(double(InertiaFactor), 0.0);
+	const FVector Rolling = (Velocity - FVector::CrossProduct(FVector::UpVector, AngularVelocity) * (K * Radius)) / (1.0 + K);
+	return FVector(Rolling.X, Rolling.Y, 0.0);
+}

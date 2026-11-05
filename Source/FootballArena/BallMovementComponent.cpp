@@ -1,6 +1,7 @@
 #include "BallMovementComponent.h"
 #include "BallInteractionComponent.h"
 #include "BallStateComponent.h"
+#include "PlayerBallInteractionComponent.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/SphereComponent.h"
 #include "Engine/World.h"
@@ -85,6 +86,99 @@ FVector UBallMovementComponent::AeroForce(const FVector& Velocity, const FVector
 
 FVector UBallMovementComponent::ComputeAeroForce(FVector Velocity, FVector AngularVelocityDeg, bool bAirborne) const {
 	return AeroForce(Velocity, FMath::DegreesToRadians(AngularVelocityDeg), GetBallRadius(), bAirborne);
+}
+
+// dv/dt = -(A + K v^2) from V0 >= 0: the distance covered in T and the speed then (it stops, never reverses).
+static double RollDistance(double V0, double A, double K, double T, double& OutSpeed) {
+	if (V0 <= 0.0 || T <= 0.0) {
+		OutSpeed = FMath::Max(V0, 0.0);
+		return 0.0;
+	}
+	if (K < 1e-12) {
+		const double Tc = A > 1e-9 ? FMath::Min(T, V0 / A) : T;
+		OutSpeed = V0 - A * Tc;
+		return V0 * Tc - 0.5 * A * Tc * Tc;
+	}
+	if (A < 1e-9) {
+		OutSpeed = V0 / (1.0 + K * V0 * T);
+		return FMath::Loge(1.0 + K * V0 * T) / K;
+	}
+	// v = S tan(Phi0 - W t), x = ln(cos(Phi0 - W t) / cos Phi0) / K, until it stops at t = Phi0 / W.
+	const double S = FMath::Sqrt(A / K), W = FMath::Sqrt(A * K), Phi0 = FMath::Atan(V0 / S);
+	const double Tc = FMath::Min(T, Phi0 / W);
+	OutSpeed = S * FMath::Tan(Phi0 - W * Tc);
+	return FMath::Loge(FMath::Cos(Phi0 - W * Tc) / FMath::Cos(Phi0)) / K;
+}
+
+FVector UBallMovementComponent::PredictFreeMotion(FVector Location, FVector Velocity, bool bAirborne, float LandZ, float Gravity, float Decel, float DragK,
+	float Time, FVector& OutVelocity) {
+	double T = FMath::Max(double(Time), 0.0);
+	FVector P = Location, V = Velocity;
+	if (bAirborne) {
+		// z(t) = z0 + vz t + g t^2 / 2 down to LandZ: the later root (g < 0).
+		const double G = Gravity, Z0 = P.Z - LandZ, Vz = V.Z, Disc = Vz * Vz - 2.0 * G * Z0;
+		const double Land = (G < 0.0 && Disc >= 0.0) ? FMath::Clamp((-Vz - FMath::Sqrt(Disc)) / G, 0.0, T) : T;
+		P += FVector(V.X, V.Y, 0.0) * Land;
+		P.Z = Location.Z + Vz * Land + 0.5 * G * Land * Land;
+		V.Z = Vz + G * Land;
+		T -= Land;
+		if (T <= 0.0) {
+			OutVelocity = V;
+			return P;
+		}
+		P.Z = LandZ;
+		V.Z = 0.0;
+	}
+	const FVector Flat(V.X, V.Y, 0.0);
+	const double Speed = Flat.Size();
+	if (Speed < UE_KINDA_SMALL_NUMBER) {
+		OutVelocity = FVector::ZeroVector;
+		return P;
+	}
+	double SpeedAfter = 0.0;
+	const double Distance = RollDistance(Speed, Decel, DragK, T, SpeedAfter);
+	OutVelocity = Flat / Speed * SpeedAfter;
+	return P + Flat / Speed * Distance;
+}
+
+void UBallMovementComponent::GetRollModel(float& OutDecel, float& OutDragK) const {
+	const UPrimitiveComponent* Body = GetBody();
+	const double Radius = GetBallRadius();
+	double Mass = 0.43, InertiaFactor = 2.0 / 3.0;
+	if (Body && Body->IsSimulatingPhysics()) {
+		Mass = FMath::Max(double(Body->GetMass()), 0.01);
+		InertiaFactor = Body->GetInertiaTensor().X / (Mass * Radius * Radius);
+	}
+	const double RollShare = 1.0 / (1.0 + FMath::Max(InertiaFactor, 0.0));
+	OutDecel = bApplyPhysicsExtras ? float(RollShare * RollingResistance) : 0.f;
+	OutDragK = bApplyPhysicsExtras ? float(RollShare * AeroForceScale * (DragCdHigh + DragCdCrisisStep) / Mass) : 0.f;
+}
+
+float UBallMovementComponent::SpeedToRoll(float Distance, float Time, float Decel, float DragK) {
+	if (Distance <= 0.f || Time <= 0.f) {
+		return 0.f;
+	}
+	// The distance covered grows with the starting speed, so halve the interval until it is close enough.
+	double Low = 0.0, High = 5000.0;
+	for (int32 i = 0; i < 48; ++i) {
+		const double Mid = 0.5 * (Low + High);
+		double After = 0.0;
+		if (RollDistance(Mid, Decel, DragK, Time, After) < Distance) {
+			Low = Mid;
+		} else {
+			High = Mid;
+		}
+	}
+	return float(0.5 * (Low + High));
+}
+
+FVector UBallMovementComponent::PredictFreeBall(float Time, FVector& OutVelocity) const {
+	float Decel = 0.f, DragK = 0.f;
+	GetRollModel(Decel, DragK);
+	const UWorld* World = GetWorld();
+	const FVector Location = GetOwner() ? GetOwner()->GetActorLocation() : FVector::ZeroVector;
+	return PredictFreeMotion(Location, GetBallVelocity(), !bGrounded, float(GroundZ + GetBallRadius()), World ? World->GetGravityZ() : -980.f, Decel,
+		DragK, Time, OutVelocity);
 }
 
 void UBallMovementComponent::AsyncPhysicsTickComponent(float DeltaTime, float SimTime) {
@@ -218,6 +312,13 @@ void UBallMovementComponent::Launch(FVector VelocityChange, FVector AngularImpul
 	if (!Body || !BallInteraction) {
 		return;
 	}
+	// The kicker's foot (spec §61): kicking with the weak foot costs speed and accuracy. The Blueprint's kicks don't name
+	// their kicker, so the player holding the ball is the one kicking it.
+	const AActor* Striker = Kicker ? Kicker : (BallState ? BallState->GetBallOwner() : nullptr);
+	UPlayerBallInteractionComponent* Feet = Striker ? Striker->FindComponentByClass<UPlayerBallInteractionComponent>() : nullptr;
+	if (Feet) {
+		VelocityChange = Feet->ApplyKickFoot(VelocityChange, GetOwner()->GetActorLocation());
+	}
 	// The old ApplyKick's two velocity-change impulses, as a strike command (spec §145: only a capture outranks it). The
 	// state changes now; the impulses land at the arbitration point, before this frame's physics step.
 	Body->SetSimulatePhysics(true);
@@ -236,7 +337,13 @@ void UBallMovementComponent::Launch(FVector VelocityChange, FVector AngularImpul
 		C.bSetAngularVelocity = true;
 		C.AngularVelocityDeg = FVector(AngularImpulseDegrees.X, AngularImpulseDegrees.Y, SpinNow.Z + AngularImpulseDegrees.Z);
 	} else {
-		C.AngularImpulse = FMath::DegreesToRadians(AngularImpulseDegrees); // sidespin only (the finesse): the ball keeps its roll
+		// Sidespin only (the finesse): the ball keeps its roll. FIFA 22 has one finesse button and the kicking foot sets the
+		// curl: the inside of the right foot bends the ball left (-Z), the left foot right (+Z).
+		FVector Spin = AngularImpulseDegrees;
+		if (Feet) {
+			Spin.Z = FMath::Abs(Spin.Z) * (Feet->GetLastKickFoot().Foot == EFootSelection::Left ? 1.0 : -1.0);
+		}
+		C.AngularImpulse = FMath::DegreesToRadians(Spin);
 	}
 	BallInteraction->SubmitResponse(C);
 	if (BallState) {

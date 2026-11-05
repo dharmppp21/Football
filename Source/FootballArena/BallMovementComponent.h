@@ -148,6 +148,30 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Ball|Aero")
 	FVector ComputeAeroForce(FVector Velocity, FVector AngularVelocityDeg, bool bAirborne) const;
 
+	// Spec §72, read-only: where the ball will be in Time seconds if nothing touches it, and its velocity then (cm/s),
+	// from its motion now (with this frame's queued response, as GetBallVelocity). It never moves the ball. Uses this ball's
+	// grass resistance, its low-speed drag (DragCdHigh + DragCdCrisisStep: below the drag crisis, ~12 m/s) and the body's
+	// own mass and inertia. Checked against the FIFA roll test: 6.50 m predicted from 3.4 m/s, 6.57 m measured in PIE.
+	UFUNCTION(BlueprintPure, Category = "Ball|Prediction")
+	FVector PredictFreeBall(float Time, FVector& OutVelocity) const;
+
+	// The free-ball model PredictFreeBall uses. On the ground: dv/dt = -(Decel + DragK v^2) along the motion, in closed form
+	// (a rolling ball turns 1 / (1 + I / (m r^2)) of the resistance and the drag into slowing; 0.6 for the hollow shell).
+	// In the air (bAirborne): a ballistic arc under Gravity (cm/s^2, negative) until the centre is back at LandZ, then
+	// rolling. No bounce, air drag or Magnus in the air part - add them when receiving needs them (master plan 11).
+	UFUNCTION(BlueprintPure, Category = "Ball|Prediction")
+	static FVector PredictFreeMotion(FVector Location, FVector Velocity, bool bAirborne, float LandZ, float Gravity, float Decel, float DragK,
+		float Time, FVector& OutVelocity);
+
+	// This ball's rolling model (PredictFreeMotion's Decel in cm/s^2 and DragK in 1/cm), from its resistance, drag and body.
+	UFUNCTION(BlueprintPure, Category = "Ball|Prediction")
+	void GetRollModel(float& OutDecel, float& OutDragK) const;
+
+	// The rolling model turned round: the speed (cm/s) a ball needs now to roll Distance (cm) in Time (s). A ball that
+	// stops on the way stops there, so short distances need little speed.
+	UFUNCTION(BlueprintPure, Category = "Ball|Prediction")
+	static float SpeedToRoll(float Distance, float Time, float Decel, float DragK);
+
 	// Test recorder: one sample per tick for Duration seconds.
 	UFUNCTION(BlueprintCallable, Category = "Ball|Debug")
 	void StartRecording(float Duration);
