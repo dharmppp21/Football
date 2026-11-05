@@ -1,0 +1,241 @@
+<mujoco model="footballer">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.002000" integrator="implicitfast" cone="elliptic"/>
+  <size memory="8M"/>
+  <visual><global offwidth="1280" offheight="720"/><quality shadowsize="4096"/>
+    <headlight ambient="0.35 0.35 0.35" diffuse="0.5 0.5 0.5" specular="0.1 0.1 0.1"/></visual>
+  <asset>
+    <texture name="pitch" type="2d" builtin="checker" rgb1="0.20 0.45 0.20" rgb2="0.24 0.52 0.24" width="512" height="512"/>
+    <material name="pitch" texture="pitch" texrepeat="60 40"/>
+    <texture name="sky" type="skybox" builtin="gradient" rgb1="0.45 0.65 0.85" rgb2="0.1 0.1 0.15" width="512" height="512"/>
+  </asset>
+  <default>
+    <joint damping="2" armature="0.02" limited="true"/>
+    <geom contype="2" conaffinity="1" condim="3" friction="1.0 0.005 0.0001" solref="0.02 1" rgba="0.8 0.6 0.4 1"/>
+    <position ctrllimited="true" forcelimited="true"/>
+  </default>
+  <worldbody>
+    <light directional="true" pos="0 0 20" dir="-0.4 0.3 -1" diffuse="0.7 0.7 0.7" castshadow="true"/>
+    <geom name="ground" type="plane" size="60 40 0.1" contype="1" conaffinity="1" friction="1.0 0.005 0.0001" material="pitch"/>
+    <body name="Hips" pos="0.0014288 -3.006e-05 0.9775"><freejoint name="root"/>
+      <geom name="Hips_g0" type="capsule" fromto="0 -0.07 -0.03 0 0.07 -0.03" size="0.09" mass="8.377"/>
+      <body name="Spine" pos="-0.0063859 0 0.10737">
+        <joint name="Spine_0" axis="0 1 0" range="-0.5236 0.7854"/>
+        <joint name="Spine_1" axis="1 0 0" range="-0.4363 0.4363"/>
+        <joint name="Spine_2" axis="0 0 1" range="-0.5236 0.5236"/>
+        <geom name="Spine_g0" type="capsule" fromto="-0.0037251 -0.07 0.062634 -0.0037251 0.07 0.062634" size="0.085" mass="6.127"/>
+        <body name="Spine1" pos="-0.0074503 0 0.12527">
+          <joint name="Spine1_0" axis="0 1 0" range="-0.5236 0.7854"/>
+          <joint name="Spine1_1" axis="1 0 0" range="-0.4363 0.4363"/>
+          <joint name="Spine1_2" axis="0 0 1" range="-0.5236 0.5236"/>
+          <geom name="Spine1_g0" type="capsule" fromto="-0.0042573 -0.075 0.071581 -0.0042573 0.075 0.071581" size="0.09" mass="6.127"/>
+          <body name="Spine2" pos="-0.0085146 0 0.14316">
+            <joint name="Spine2_0" axis="0 1 0" range="-0.5236 0.7854"/>
+            <joint name="Spine2_1" axis="1 0 0" range="-0.4363 0.4363"/>
+            <joint name="Spine2_2" axis="0 0 1" range="-0.5236 0.5236"/>
+            <geom name="Spine2_g0" type="capsule" fromto="-0.0047894 -0.08 0.080529 -0.0047894 0.08 0.080529" size="0.1" mass="9.975"/>
+            <body name="Neck" pos="-0.0095789 0 0.16106">
+              <joint name="Neck_0" axis="0 1 0" range="-0.7156 0.8901"/>
+              <joint name="Neck_1" axis="1 0 0" range="-0.5236 0.7330"/>
+              <joint name="Neck_2" axis="0 0 1" range="-0.7854 0.7854"/>
+              <geom name="Neck_g0" type="capsule" fromto="0 0 0 0.0102 0 0.041868" size="0.05" mass="0.9975"/>
+              <body name="Head" pos="0.0102 0 0.041868">
+                <joint name="Head_0" axis="0 1 0" range="-1.1694 0.6981"/>
+                <joint name="Head_1" axis="1 0 0" range="-1.0647 0.6283"/>
+                <joint name="Head_2" axis="0 0 1" range="-0.8727 0.8901"/>
+                <geom name="Head_g0" type="sphere" pos="0.025 0 0.11" size="0.1" mass="4.2"/>
+              </body>
+            </body>
+            <body name="LeftShoulder" pos="-0.0095696 0.074591 0.13239">
+              <joint name="LeftShoulder_0" axis="1 0 0" range="-0.5934 0.6109"/>
+              <joint name="LeftShoulder_1" axis="0 0 1" range="-0.7679 0.8727"/>
+              <joint name="LeftShoulder_2" axis="0 1 0" range="-0.5760 0.4538"/>
+              <geom name="LeftShoulder_g0" type="capsule" fromto="2.7922e-06 0.022325 -0.0085377 1.8615e-05 0.14884 -0.056918" size="0.045" mass="0.9975"/>
+              <body name="LeftArm" pos="1.8615e-05 0.14884 -0.056918">
+                <joint name="LeftArm_0" axis="1 0 0" range="-2.5307 2.1118"/>
+                <joint name="LeftArm_1" axis="0 0 1" range="-2.0944 2.0944"/>
+                <joint name="LeftArm_2" axis="0 1 0" range="-2.5133 2.2864"/>
+                <geom name="LeftArm_g0" type="capsule" fromto="-0.001132 0.022431 -0.0013528 -0.0096896 0.19201 -0.01158" size="0.045" mass="2.032"/>
+                <body name="LeftForeArm" pos="-0.011954 0.23687 -0.014285">
+                  <joint name="LeftForeArm_0" axis="0 0 -1" range="-0.3491 2.6180"/>
+                  <joint name="LeftForeArm_1" axis="0 1 0" range="-1.5708 1.5708"/>
+                  <geom name="LeftForeArm_g0" type="capsule" fromto="0.00068521 0.017977 0.0006017 0.0075477 0.19802 0.0066277" size="0.036" mass="1.215"/>
+                  <body name="LeftHand" pos="0.0089181 0.23397 0.0078311">
+                    <joint name="LeftHand_0" axis="1 0 0" range="-1.2217 1.9373"/>
+                    <joint name="LeftHand_1" axis="0 0 1" range="-1.0647 0.7330"/>
+                    <joint name="LeftHand_2" axis="0 1 0" range="-1.3963 1.4486"/>
+                    <geom name="LeftHand_g0" type="capsule" fromto="0 0 -0 0.017648 0.097455 -0.01015" size="0.035" mass="0.4575"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+            <body name="RightShoulder" pos="-0.0095882 -0.074591 0.13239">
+              <joint name="RightShoulder_0" axis="1 0 0" range="-0.6109 0.5934"/>
+              <joint name="RightShoulder_1" axis="0 0 1" range="-0.8727 0.7679"/>
+              <joint name="RightShoulder_2" axis="0 1 0" range="-0.5760 0.4538"/>
+              <geom name="RightShoulder_g0" type="capsule" fromto="-2.7918e-06 -0.022325 -0.0085377 -1.8612e-05 -0.14884 -0.056918" size="0.045" mass="0.9975"/>
+              <body name="RightArm" pos="-1.8612e-05 -0.14884 -0.056918">
+                <joint name="RightArm_0" axis="1 0 0" range="-2.1118 2.5307"/>
+                <joint name="RightArm_1" axis="0 0 1" range="-2.0944 2.0944"/>
+                <joint name="RightArm_2" axis="0 1 0" range="-2.5133 2.2864"/>
+                <geom name="RightArm_g0" type="capsule" fromto="-0.0011098 -0.022432 -0.0013529 -0.0094991 -0.192 -0.01158" size="0.045" mass="2.032"/>
+                <body name="RightForeArm" pos="-0.011719 -0.23687 -0.014285">
+                  <joint name="RightForeArm_0" axis="0 0 1" range="-0.3491 2.6180"/>
+                  <joint name="RightForeArm_1" axis="0 1 0" range="-1.5708 1.5708"/>
+                  <geom name="RightForeArm_g0" type="capsule" fromto="0.00062683 -0.017979 0.00060177 0.0069037 -0.19801 0.0066276" size="0.036" mass="1.215"/>
+                  <body name="RightHand" pos="0.0081573 -0.23397 0.0078311">
+                    <joint name="RightHand_0" axis="1 0 0" range="-1.9373 1.2217"/>
+                    <joint name="RightHand_1" axis="0 0 1" range="-0.7330 1.0647"/>
+                    <joint name="RightHand_2" axis="0 1 0" range="-1.3963 1.4486"/>
+                    <geom name="RightHand_g0" type="capsule" fromto="0 -0 -0 0.018878 -0.10062 -0.0076733" size="0.035" mass="0.4575"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="LeftUpLeg" pos="0.0092989 0.10169 -0.059699">
+        <joint name="LeftUpLeg_0" axis="0 1 0" range="-2.2689 0.6109"/>
+        <joint name="LeftUpLeg_1" axis="1 0 0" range="-0.6109 1.0472"/>
+        <joint name="LeftUpLeg_2" axis="0 0 1" range="-0.8727 0.8727"/>
+        <geom name="LeftUpLeg_g0" type="capsule" fromto="-0.0019576 0.0021177 -0.032372 -0.021068 0.022791 -0.34839" size="0.065" mass="10.62"/>
+        <body name="LeftLeg" pos="-0.024984 0.027027 -0.41313">
+          <joint name="LeftLeg_0" axis="0 1 0" range="-0.1571 2.9147"/>
+          <geom name="LeftLeg_g0" type="capsule" fromto="-0.0015415 0.001297 -0.024919 -0.020422 0.017183 -0.33012" size="0.05" mass="3.248"/>
+          <body name="LeftFoot" pos="-0.023505 0.019777 -0.37995">
+            <joint name="LeftFoot_0" axis="0 1 0" range="-0.9425 0.9599"/>
+            <joint name="LeftFoot_1" axis="1 0 0" range="-0.8029 0.5934"/>
+            <joint name="LeftFoot_2" axis="0 0 1" range="-0.8901 0.9425"/>
+            <geom name="LeftFoot_g0" type="box" pos="0.052281 0.0096971 -0.087218" size="0.1093 0.045 0.0375" mass="0.8025"/>
+            <geom name="LeftFoot_g1" type="ellipsoid" pos="0.052281 0.0096971 -0.082218" size="0.1143 0.048 0.045" contype="0" conaffinity="0" mass="0"/>
+            <body name="LeftToeBase" pos="0.16156 0.019394 -0.11654">
+              <joint name="LeftToeBase_0" axis="0 1 0" range="-0.8727 0.7330"/>
+              <geom name="LeftToeBase_g0" type="box" pos="0.046 0.004 0.01182" size="0.045 0.045 0.02" mass="0.225"/>
+              <geom name="LeftToeBase_g1" type="ellipsoid" pos="0.046 0.004 0.01582" size="0.05 0.047 0.026" contype="0" conaffinity="0" mass="0"/>
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="RightUpLeg" pos="0.0087699 -0.10169 -0.059699">
+        <joint name="RightUpLeg_0" axis="0 1 0" range="-2.2689 0.6109"/>
+        <joint name="RightUpLeg_1" axis="1 0 0" range="-1.0472 0.6109"/>
+        <joint name="RightUpLeg_2" axis="0 0 1" range="-0.8727 0.8727"/>
+        <geom name="RightUpLeg_g0" type="capsule" fromto="-0.0016617 -0.0021188 -0.032388 -0.017873 -0.022789 -0.34836" size="0.065" mass="10.62"/>
+        <body name="RightLeg" pos="-0.021196 -0.027027 -0.41313">
+          <joint name="RightLeg_0" axis="0 1 0" range="-0.1571 2.9147"/>
+          <geom name="RightLeg_g0" type="capsule" fromto="-0.0017828 -0.0012962 -0.024903 -0.023636 -0.017184 -0.33015" size="0.05" mass="3.248"/>
+          <body name="RightFoot" pos="-0.027202 -0.019777 -0.37995">
+            <joint name="RightFoot_0" axis="0 1 0" range="-0.9425 0.9599"/>
+            <joint name="RightFoot_1" axis="1 0 0" range="-0.5934 0.8029"/>
+            <joint name="RightFoot_2" axis="0 0 1" range="-0.9425 0.8901"/>
+            <geom name="RightFoot_g0" type="box" pos="0.050975 -0.0096973 -0.087219" size="0.108 0.045 0.0375" mass="0.8025"/>
+            <geom name="RightFoot_g1" type="ellipsoid" pos="0.050975 -0.0096973 -0.082219" size="0.113 0.048 0.045" contype="0" conaffinity="0" mass="0"/>
+            <body name="RightToeBase" pos="0.15895 -0.019395 -0.11654">
+              <joint name="RightToeBase_0" axis="0 1 0" range="-0.8727 0.7330"/>
+              <geom name="RightToeBase_g0" type="box" pos="0.046 -0.004 0.011825" size="0.045 0.045 0.02" mass="0.225"/>
+              <geom name="RightToeBase_g1" type="ellipsoid" pos="0.046 -0.004 0.015825" size="0.05 0.047 0.026" contype="0" conaffinity="0" mass="0"/>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+    <body name="ball" pos="1 0 0.11"><freejoint name="ball"/><inertial pos="0 0 0" mass="0.43" diaginertia="0.0034687 0.0034687 0.0034687"/><geom name="ball_g" type="sphere" size="0.11" contype="0" conaffinity="0" rgba="1 1 1 1"/></body>
+  </worldbody>
+  <contact>
+    <pair geom1="LeftUpLeg_g0" geom2="RightUpLeg_g0"/>
+    <pair geom1="LeftUpLeg_g0" geom2="RightLeg_g0"/>
+    <pair geom1="LeftUpLeg_g0" geom2="RightFoot_g0"/>
+    <pair geom1="LeftUpLeg_g0" geom2="RightToeBase_g0"/>
+    <pair geom1="LeftLeg_g0" geom2="RightUpLeg_g0"/>
+    <pair geom1="LeftLeg_g0" geom2="RightLeg_g0"/>
+    <pair geom1="LeftLeg_g0" geom2="RightFoot_g0"/>
+    <pair geom1="LeftLeg_g0" geom2="RightToeBase_g0"/>
+    <pair geom1="LeftFoot_g0" geom2="RightUpLeg_g0"/>
+    <pair geom1="LeftFoot_g0" geom2="RightLeg_g0"/>
+    <pair geom1="LeftFoot_g0" geom2="RightFoot_g0"/>
+    <pair geom1="LeftFoot_g0" geom2="RightToeBase_g0"/>
+    <pair geom1="LeftToeBase_g0" geom2="RightUpLeg_g0"/>
+    <pair geom1="LeftToeBase_g0" geom2="RightLeg_g0"/>
+    <pair geom1="LeftToeBase_g0" geom2="RightFoot_g0"/>
+    <pair geom1="LeftToeBase_g0" geom2="RightToeBase_g0"/>
+    <pair geom1="ball_g" geom2="ground" condim="3" friction="0.405 0.405 0 0 0" solref="-100000 -90" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="Hips_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -202.8" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="Spine_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -258.3" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="Spine1_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -258.3" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="Spine2_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -258.3" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="Neck_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -86.9" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="Head_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -86.9" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="LeftShoulder_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -179.2" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="LeftArm_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -179.2" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="LeftForeArm_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -179.2" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="LeftHand_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -179.2" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="RightShoulder_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -179.2" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="RightArm_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -179.2" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="RightForeArm_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -179.2" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="RightHand_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -179.2" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="LeftUpLeg_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -202.8" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="LeftLeg_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -102.7" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="LeftFoot_g1" condim="3" friction="0.6 0.6 0 0 0" solref="-100000 -119.6" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="LeftToeBase_g1" condim="3" friction="0.6 0.6 0 0 0" solref="-100000 -119.6" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="RightUpLeg_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -202.8" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="RightLeg_g0" condim="3" friction="0.5 0.5 0 0 0" solref="-100000 -102.7" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="RightFoot_g1" condim="3" friction="0.6 0.6 0 0 0" solref="-100000 -119.6" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+    <pair geom1="ball_g" geom2="RightToeBase_g1" condim="3" friction="0.6 0.6 0 0 0" solref="-100000 -119.6" solreffriction="-1 -150" solimp="0.95 0.99 0.001"/>
+  </contact>
+  <actuator>
+    <position name="Spine_0" joint="Spine_0" kp="800" kv="80" ctrlrange="-0.5236 0.7854" forcerange="-400 400"/>
+    <position name="Spine_1" joint="Spine_1" kp="800" kv="80" ctrlrange="-0.4363 0.4363" forcerange="-400 400"/>
+    <position name="Spine_2" joint="Spine_2" kp="800" kv="80" ctrlrange="-0.5236 0.5236" forcerange="-400 400"/>
+    <position name="Spine1_0" joint="Spine1_0" kp="800" kv="80" ctrlrange="-0.5236 0.7854" forcerange="-400 400"/>
+    <position name="Spine1_1" joint="Spine1_1" kp="800" kv="80" ctrlrange="-0.4363 0.4363" forcerange="-400 400"/>
+    <position name="Spine1_2" joint="Spine1_2" kp="800" kv="80" ctrlrange="-0.5236 0.5236" forcerange="-400 400"/>
+    <position name="Spine2_0" joint="Spine2_0" kp="800" kv="80" ctrlrange="-0.5236 0.7854" forcerange="-400 400"/>
+    <position name="Spine2_1" joint="Spine2_1" kp="800" kv="80" ctrlrange="-0.4363 0.4363" forcerange="-400 400"/>
+    <position name="Spine2_2" joint="Spine2_2" kp="800" kv="80" ctrlrange="-0.5236 0.5236" forcerange="-400 400"/>
+    <position name="Neck_0" joint="Neck_0" kp="300" kv="30" ctrlrange="-0.7156 0.8901" forcerange="-100 100"/>
+    <position name="Neck_1" joint="Neck_1" kp="300" kv="30" ctrlrange="-0.5236 0.7330" forcerange="-100 100"/>
+    <position name="Neck_2" joint="Neck_2" kp="300" kv="30" ctrlrange="-0.7854 0.7854" forcerange="-100 100"/>
+    <position name="Head_0" joint="Head_0" kp="200" kv="20" ctrlrange="-1.1694 0.6981" forcerange="-60 60"/>
+    <position name="Head_1" joint="Head_1" kp="200" kv="20" ctrlrange="-1.0647 0.6283" forcerange="-60 60"/>
+    <position name="Head_2" joint="Head_2" kp="200" kv="20" ctrlrange="-0.8727 0.8901" forcerange="-60 60"/>
+    <position name="LeftShoulder_0" joint="LeftShoulder_0" kp="300" kv="30" ctrlrange="-0.5934 0.6109" forcerange="-150 150"/>
+    <position name="LeftShoulder_1" joint="LeftShoulder_1" kp="300" kv="30" ctrlrange="-0.7679 0.8727" forcerange="-150 150"/>
+    <position name="LeftShoulder_2" joint="LeftShoulder_2" kp="300" kv="30" ctrlrange="-0.5760 0.4538" forcerange="-150 150"/>
+    <position name="LeftArm_0" joint="LeftArm_0" kp="300" kv="30" ctrlrange="-2.5307 2.1118" forcerange="-200 200"/>
+    <position name="LeftArm_1" joint="LeftArm_1" kp="300" kv="30" ctrlrange="-2.0944 2.0944" forcerange="-200 200"/>
+    <position name="LeftArm_2" joint="LeftArm_2" kp="300" kv="30" ctrlrange="-2.5133 2.2864" forcerange="-200 200"/>
+    <position name="LeftForeArm_0" joint="LeftForeArm_0" kp="200" kv="20" ctrlrange="-0.3491 2.6180" forcerange="-150 150"/>
+    <position name="LeftForeArm_1" joint="LeftForeArm_1" kp="200" kv="20" ctrlrange="-1.5708 1.5708" forcerange="-150 150"/>
+    <position name="LeftHand_0" joint="LeftHand_0" kp="50" kv="5" ctrlrange="-1.2217 1.9373" forcerange="-40 40"/>
+    <position name="LeftHand_1" joint="LeftHand_1" kp="50" kv="5" ctrlrange="-1.0647 0.7330" forcerange="-40 40"/>
+    <position name="LeftHand_2" joint="LeftHand_2" kp="50" kv="5" ctrlrange="-1.3963 1.4486" forcerange="-40 40"/>
+    <position name="RightShoulder_0" joint="RightShoulder_0" kp="300" kv="30" ctrlrange="-0.6109 0.5934" forcerange="-150 150"/>
+    <position name="RightShoulder_1" joint="RightShoulder_1" kp="300" kv="30" ctrlrange="-0.8727 0.7679" forcerange="-150 150"/>
+    <position name="RightShoulder_2" joint="RightShoulder_2" kp="300" kv="30" ctrlrange="-0.5760 0.4538" forcerange="-150 150"/>
+    <position name="RightArm_0" joint="RightArm_0" kp="300" kv="30" ctrlrange="-2.1118 2.5307" forcerange="-200 200"/>
+    <position name="RightArm_1" joint="RightArm_1" kp="300" kv="30" ctrlrange="-2.0944 2.0944" forcerange="-200 200"/>
+    <position name="RightArm_2" joint="RightArm_2" kp="300" kv="30" ctrlrange="-2.5133 2.2864" forcerange="-200 200"/>
+    <position name="RightForeArm_0" joint="RightForeArm_0" kp="200" kv="20" ctrlrange="-0.3491 2.6180" forcerange="-150 150"/>
+    <position name="RightForeArm_1" joint="RightForeArm_1" kp="200" kv="20" ctrlrange="-1.5708 1.5708" forcerange="-150 150"/>
+    <position name="RightHand_0" joint="RightHand_0" kp="50" kv="5" ctrlrange="-1.9373 1.2217" forcerange="-40 40"/>
+    <position name="RightHand_1" joint="RightHand_1" kp="50" kv="5" ctrlrange="-0.7330 1.0647" forcerange="-40 40"/>
+    <position name="RightHand_2" joint="RightHand_2" kp="50" kv="5" ctrlrange="-1.3963 1.4486" forcerange="-40 40"/>
+    <position name="LeftUpLeg_0" joint="LeftUpLeg_0" kp="800" kv="80" ctrlrange="-2.2689 0.6109" forcerange="-400 400"/>
+    <position name="LeftUpLeg_1" joint="LeftUpLeg_1" kp="800" kv="80" ctrlrange="-0.6109 1.0472" forcerange="-400 400"/>
+    <position name="LeftUpLeg_2" joint="LeftUpLeg_2" kp="800" kv="80" ctrlrange="-0.8727 0.8727" forcerange="-400 400"/>
+    <position name="LeftLeg_0" joint="LeftLeg_0" kp="600" kv="60" ctrlrange="-0.1571 2.9147" forcerange="-400 400"/>
+    <position name="LeftFoot_0" joint="LeftFoot_0" kp="400" kv="40" ctrlrange="-0.9425 0.9599" forcerange="-250 250"/>
+    <position name="LeftFoot_1" joint="LeftFoot_1" kp="400" kv="40" ctrlrange="-0.8029 0.5934" forcerange="-250 250"/>
+    <position name="LeftFoot_2" joint="LeftFoot_2" kp="400" kv="40" ctrlrange="-0.8901 0.9425" forcerange="-250 250"/>
+    <position name="LeftToeBase_0" joint="LeftToeBase_0" kp="100" kv="10" ctrlrange="-0.8727 0.7330" forcerange="-60 60"/>
+    <position name="RightUpLeg_0" joint="RightUpLeg_0" kp="800" kv="80" ctrlrange="-2.2689 0.6109" forcerange="-400 400"/>
+    <position name="RightUpLeg_1" joint="RightUpLeg_1" kp="800" kv="80" ctrlrange="-1.0472 0.6109" forcerange="-400 400"/>
+    <position name="RightUpLeg_2" joint="RightUpLeg_2" kp="800" kv="80" ctrlrange="-0.8727 0.8727" forcerange="-400 400"/>
+    <position name="RightLeg_0" joint="RightLeg_0" kp="600" kv="60" ctrlrange="-0.1571 2.9147" forcerange="-400 400"/>
+    <position name="RightFoot_0" joint="RightFoot_0" kp="400" kv="40" ctrlrange="-0.9425 0.9599" forcerange="-250 250"/>
+    <position name="RightFoot_1" joint="RightFoot_1" kp="400" kv="40" ctrlrange="-0.5934 0.8029" forcerange="-250 250"/>
+    <position name="RightFoot_2" joint="RightFoot_2" kp="400" kv="40" ctrlrange="-0.9425 0.8901" forcerange="-250 250"/>
+    <position name="RightToeBase_0" joint="RightToeBase_0" kp="100" kv="10" ctrlrange="-0.8727 0.7330" forcerange="-60 60"/>
+  </actuator>
+</mujoco>

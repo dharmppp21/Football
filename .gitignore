@@ -67,3 +67,6 @@ Content/CaptureManager/
 
 # ---- Python bytecode from the editor tools ----
 __pycache__/
+
+# ---- Third-party SDKs, unpacked from their release zips ----
+ThirdParty/
