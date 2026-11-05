@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Engine/DataTable.h"
+#include "GameplayTagContainer.h"
 #include "FootballTypes.generated.h"
 
 class AActor;
@@ -62,8 +63,8 @@ enum class EContactValidation : uint8 { Valid, TooFar, WrongDirection, OutsideWi
 UENUM(BlueprintType)
 enum class ESkillState : uint8 { None, Starting, Contacting, Redirecting, Releasing, Recovering, Cancelled, Completed };
 
-// Feet a skill may be done with (doc §10 AllowedFeet). A skill's Montage is its right-foot version and its
-// MirroredMontage the left-foot one.
+// Feet an action may be done with (spec §3 AllowedFoot). An action's Montage is its right-foot version and its
+// AlternateMontage the left-foot one.
 UENUM(BlueprintType)
 enum class EFootSelection : uint8 { Right, Left, Both };
 
@@ -145,6 +146,29 @@ struct FBallContactDescriptor {
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Contact")
 	FVector LocalBallOffset = FVector::ZeroVector;
 
+	// Spec §71: the ball centre for this contact relative to the capsule's ground point at ContactTime, in skill space,
+	// worked out from the clip by the bake (Tools/prep_skill_anims.py). Player alignment (§15) moves the player so the
+	// real ball sits there; the ball itself is never moved to it.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Contact")
+	FVector ExpectedBallOffset = FVector::ZeroVector;
+
+	// The body region's path through the window, baked from the clip like ExpectedBallOffset: its point and normal in skill
+	// space relative to the capsule's ground point, one per clip key from RegionPathStart (montage seconds) every
+	// RegionPathStep. The touch sweeps this path at a fine fixed step between frames, so it is found at the same moment at
+	// any frame rate (the live pose exists only at frame ends; its straight chord cut the elastico's grazing outside touch
+	// early, more at 30 fps). Empty = the live region along its chord.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Contact")
+	TArray<FVector> RegionPath;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Contact")
+	TArray<FVector> RegionPathNormal;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Contact")
+	float RegionPathStart = 0.f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Contact", meta = (ClampMin = "0.001"))
+	float RegionPathStep = 1.f / 30.f;
+
 	// Test 1: ball centre within this of where the contact wants it (cm).
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation")
 	float ContactTolerance = 6.f;
@@ -168,8 +192,9 @@ struct FBallContactDescriptor {
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response", meta = (ClampMin = "-1"))
 	float SpinTransfer = -1.f;
 
-	// The intended exit, in skill space: an INTENT, never a mandatory trajectory (§13). A release's authored exit
-	// (with the Exit fields below).
+	// The intended exit, in skill space: an INTENT, never a mandatory trajectory (§13) - what the bounded assist bends the
+	// physical result toward after an action's LAST contact. An earlier contact's intent is worked out at the touch: the
+	// velocity that rolls the ball to the next contact's expected spot in time.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Intent")
 	FVector PreferredDirection = FVector::ForwardVector;
 
@@ -178,8 +203,7 @@ struct FBallContactDescriptor {
 
 	// Bounded assistance (§14): the share of the gap between the physical result and the intent that is closed
 	// (0.10-0.25 realistic, above 0.40 only for arcade-like actions), and the most it may turn the ball (degrees) or
-	// change its speed (cm/s); Phase 4 tunes the bounds. The frozen Elastico still uses AssistStrength the old way
-	// (1 = exactly what its baked path needs) until Phase 6.
+	// change its speed (cm/s). The action's AssistProfile and the player's skill (UBallAssist::ScaleForSkill) scale them.
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Assist", meta = (ClampMin = "0", ClampMax = "1"))
 	float AssistStrength = 0.15f;
 
@@ -188,6 +212,10 @@ struct FBallContactDescriptor {
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Assist", meta = (ClampMin = "0"))
 	float MaxAssistSpeed = 100.f;
+
+	// An arcade-like action may close more than 0.40 of the gap (§14); without it UBallAssist caps the strength at 0.40.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Assist")
+	bool bArcadeAssist = false;
 
 	// Debounce (§99): the contact counts once per window; the next window re-arms it (after a confirmed separation if
 	// the region is still on the ball), and bAllowRecontact lets a confirmed separation re-arm it inside the window.
@@ -212,6 +240,191 @@ struct FBallContactDescriptor {
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Exit")
 	float InheritBallVelocity = 0.f;
+};
+
+// A player's attributes (spec §62), 0-100. They change assist bounds, timing tolerance, contact quality, action selection
+// and physical parameter ranges - never the physics rules themselves.
+USTRUCT(BlueprintType)
+struct FFootballAttributes {
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Control", meta = (ClampMin = "0", ClampMax = "100")) float BallControl = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Control", meta = (ClampMin = "0", ClampMax = "100")) float Dribbling = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement", meta = (ClampMin = "0", ClampMax = "100")) float Agility = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement", meta = (ClampMin = "0", ClampMax = "100")) float Balance = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement", meta = (ClampMin = "0", ClampMax = "100")) float Acceleration = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement", meta = (ClampMin = "0", ClampMax = "100")) float SprintSpeed = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passing", meta = (ClampMin = "0", ClampMax = "100")) float Passing = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passing", meta = (ClampMin = "0", ClampMax = "100")) float LongPassing = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Passing", meta = (ClampMin = "0", ClampMax = "100")) float Crossing = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shooting", meta = (ClampMin = "0", ClampMax = "100")) float ShotPower = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shooting", meta = (ClampMin = "0", ClampMax = "100")) float Finishing = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shooting", meta = (ClampMin = "0", ClampMax = "100")) float Curve = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shooting", meta = (ClampMin = "0", ClampMax = "100")) float Volleys = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Shooting", meta = (ClampMin = "0", ClampMax = "100")) float Heading = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mental", meta = (ClampMin = "0", ClampMax = "100")) float Reactions = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Mental", meta = (ClampMin = "0", ClampMax = "100")) float Composure = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Technique", meta = (ClampMin = "0", ClampMax = "100")) float WeakFoot = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Technique", meta = (ClampMin = "0", ClampMax = "100")) float SkillMoves = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Goalkeeping", meta = (ClampMin = "0", ClampMax = "100")) float GoalkeeperHandling = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Goalkeeping", meta = (ClampMin = "0", ClampMax = "100")) float GoalkeeperDiving = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Goalkeeping", meta = (ClampMin = "0", ClampMax = "100")) float GoalkeeperReflexes = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Goalkeeping", meta = (ClampMin = "0", ClampMax = "100")) float GoalkeeperKicking = 50.f;
+};
+
+// Input of UBallAssist::BoundedBlend (spec §14): a physical result and the intent it may be bent toward, strictly bounded.
+USTRUCT(BlueprintType)
+struct FBallAssistInput {
+	GENERATED_BODY()
+
+	// The ball's velocity as physics produced it (cm/s).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Assist") FVector RawVelocity = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Assist") FVector IntendedDirection = FVector::ForwardVector;
+	// 0 or less = keep the raw speed.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Assist") float IntendedSpeed = 0.f;
+	// The share of the gap closed: 0.10-0.25 realistic, 0.25-0.40 strong, above 0.40 only with bArcade.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Assist", meta = (ClampMin = "0", ClampMax = "1")) float Strength = 0.15f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Assist", meta = (ClampMin = "0")) float MaxAngleDegrees = 10.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Assist", meta = (ClampMin = "0")) float MaxSpeedChange = 100.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Assist") bool bArcade = false;
+};
+
+USTRUCT(BlueprintType)
+struct FBallAssistResult {
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Assist") FVector Velocity = FVector::ZeroVector;
+	// Velocity - RawVelocity: what the assist adds, delivered as a velocity-change impulse on top of the physical result.
+	UPROPERTY(BlueprintReadOnly, Category = "Assist") FVector VelocityChange = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Assist") float AngleCorrectionDegrees = 0.f;
+	UPROPERTY(BlueprintReadOnly, Category = "Assist") float SpeedCorrection = 0.f;
+	UPROPERTY(BlueprintReadOnly, Category = "Assist") float StrengthUsed = 0.f;
+	// The strength asked for was above 0.40 without bArcade and was capped.
+	UPROPERTY(BlueprintReadOnly, Category = "Assist") bool bStrengthCapped = false;
+};
+
+// Why the touch dribble touched the ball this tick (UPlayerBallInteractionComponent::PlanDribbleTouch). None = no touch.
+// FirstTouch takes a loose ball; Planned = the touch interval is up; Start = the ball is at rest and the player sets off;
+// Turn = the asked direction left the ball's path; Overrun = the player is running over the ball; Correct = the ball would be
+// out of the foot's reach by the next planned touch (the player slowed, sped up or the ball drifts); Stop = the stick was let go.
+UENUM(BlueprintType)
+enum class EDribbleTouchReason : uint8 { None, FirstTouch, Planned, Start, Turn, Overrun, Correct, Stop };
+
+// Spec §78 FBallControlProfile, the part the touch dribble uses (master plan 7.3 / 7.4, brought forward on 2026-10-10): FIFA
+// dribbles with separate touches - "Dribble Touch Intervals ... how close the player keeps the ball" (EA, FC 26 Pitch Notes) -
+// and the ball only ever moves from a touch at the feet. Where the foot meets the ball, how far it can reach, where a touch
+// sends the ball and how often, and how much one touch may change it.
+USTRUCT(BlueprintType)
+struct FBallControlProfile {
+	GENERATED_BODY()
+
+	// The foot meets the ball this far in front of the player's centre (cm, along the facing).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Control", meta = (ClampMin = "0")) float TouchDistance = 40.f;
+	// A loose ball is taken only within this (cm, ground plane) of the touch point: no visible pull on a pick-up (§70). A held
+	// ball can be touched anywhere the legs reach (FDribbleTouchQuery::HeldReach) - the same in every profile.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Control", meta = (ClampMin = "1")) float TouchReach = 30.f;
+	// Where a touch sends the ball: this far in front of the player when the next touch is due (cm).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Control", meta = (ClampMin = "0")) float ControlDistance = 55.f;
+	// Seconds from one planned touch to the next (§78 TouchFrequency = 1 / TouchInterval).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Control", meta = (ClampMin = "0.05")) float TouchInterval = 0.4f;
+	// The most one touch may change the ball's velocity (cm/s): a sharp turn takes more than one touch, so the ball curves
+	// round instead of snapping (§21, §70).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Control", meta = (ClampMin = "0")) float MaxCorrectionSpeed = 450.f;
+	// The fastest a dribble touch sends the ball (cm/s).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Control", meta = (ClampMin = "0")) float MaxBallSpeed = 900.f;
+};
+
+// Input of UPlayerBallInteractionComponent::PlanDribbleTouch: one tick of the touch dribble, everything it needs so it runs
+// without a world (the self-test). Positions and velocities in cm and cm/s; only their ground-plane parts are used.
+USTRUCT(BlueprintType)
+struct FDribbleTouchQuery {
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") FVector PlayerLocation = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") FVector PlayerVelocity = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") FVector PlayerForward = FVector::ForwardVector;
+	// What the stick asks for: its direction times the speed it asks (zero = the stick is let go).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") FVector DesiredVelocity = FVector::ZeroVector;
+	// How fast the player's velocity changes toward the asked one (CharacterMovement's acceleration and braking, cm/s^2).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float PlayerAcceleration = 1800.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float PlayerBraking = 2200.f;
+	// The ball now (its velocity including this frame's queued response) and whether it is on the ground.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") FVector BallLocation = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") FVector BallVelocity = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") bool bBallGrounded = true;
+	// The ball's rolling model (UBallMovementComponent::GetRollModel): where a rolled ball goes.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float RollDecel = 81.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float RollDragK = 1.425e-4f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") FBallControlProfile Profile;
+	// Seconds since the last touch; seconds past the planned next one (negative = not due yet); the last touch's reason.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float TimeSinceTouch = 1.0e6f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float TimeToPlannedTouch = 0.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") EDribbleTouchReason LastReason = EDribbleTouchReason::None;
+	// The touch that takes a loose ball.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") bool bFirstTouch = false;
+	// The feet: how far each one sits to the right of the player's centre line (cm, - = left; the body regions at the feet),
+	// and the foot he prefers when the ball is in the middle. Left at 0 the touch point stays on the centre line.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float LeftFootSide = 0.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float RightFootSide = 0.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") EFootSelection PreferredFoot = EFootSelection::Right;
+	// Where the legs reach a held ball: within this of the player's centre (cm) and not behind it (see the planner). Nothing
+	// farther is ever touched - a ball out of reach is never pulled (§70). The same in every profile: RB doesn't shorten legs.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float HeldReach = 75.f;
+	// No two touches closer than MinTouchInterval (s); a turn touch once the ball's path is TurnTouchAngle (deg) off the asked
+	// direction; with the stick let go, a ball faster than StopTouchSpeed (cm/s) gets one stop touch.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float MinTouchInterval = 0.12f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float TurnTouchAngle = 20.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float StopTouchSpeed = 40.f;
+	// Touches in step with the feet (UPlayerBallInteractionComponent::bFootSyncDribble): a planned touch waits for the touching
+	// foot's window - the run loops' "Dribble Foot Window" notify, late in the swing with the toe low and still driving forward -
+	// at most once a stride, or is made a stride (at least MaxWindowWait, s) late without it; every touch sends the ball to where that foot will be at
+	// its next window a planned touch may use. bLeftWindow / bRightWindow: that foot's window came this frame; the ages are the
+	// seconds since each foot's last window; StridePeriod = one stride (s, a foot's window to its next one).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") bool bSyncToFeet = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") bool bLeftWindow = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") bool bRightWindow = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float LeftWindowAge = 1.0e6f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float RightWindowAge = 1.0e6f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float StridePeriod = 0.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float MaxWindowWait = 0.25f;
+	// A turn or correction touch waits up to this (s) for either foot's window and is made by that foot (0 = at once).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dribble") float TurnWindowWait = 0.f;
+};
+
+// Output of UPlayerBallInteractionComponent::PlanDribbleTouch.
+USTRUCT(BlueprintType)
+struct FDribbleTouchResult {
+	GENERATED_BODY()
+
+	// Where the foot meets the ball now, the ball's distance from that point (cm, ground plane), and whether the foot can reach
+	// it (on the ground and within the reach of FBallControlProfile::TouchReach).
+	UPROPERTY(BlueprintReadOnly, Category = "Dribble") FVector TouchSpot = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Dribble") float Distance = 0.f;
+	UPROPERTY(BlueprintReadOnly, Category = "Dribble") bool bInReach = false;
+	// The foot that meets the ball: the one on the ball's side of the body, the preferred one with the ball in the middle.
+	UPROPERTY(BlueprintReadOnly, Category = "Dribble") EFootSelection Foot = EFootSelection::Right;
+	// The touch to make now (None = no touch): the ball's new velocity (its vertical velocity kept), the point it is sent to and
+	// in how long, the velocity change and whether MaxCorrectionSpeed capped it.
+	UPROPERTY(BlueprintReadOnly, Category = "Dribble") EDribbleTouchReason Reason = EDribbleTouchReason::None;
+	UPROPERTY(BlueprintReadOnly, Category = "Dribble") FVector Velocity = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Dribble") FVector Target = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Dribble") float Interval = 0.f;
+	UPROPERTY(BlueprintReadOnly, Category = "Dribble") float Correction = 0.f;
+	UPROPERTY(BlueprintReadOnly, Category = "Dribble") bool bCapped = false;
+	// World seconds of the touch (set by the component when it is made).
+	UPROPERTY(BlueprintReadOnly, Category = "Dribble") float Time = 0.f;
+};
+
+// UPlayerBallInteractionComponent::ChooseKickFoot: the foot a kick is struck with, and what kicking with the weak foot costs.
+USTRUCT(BlueprintType)
+struct FKickFootChoice {
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Kick") EFootSelection Foot = EFootSelection::Right;
+	UPROPERTY(BlueprintReadOnly, Category = "Kick") bool bWeakFoot = false;
+	// The kick's speed is multiplied by SpeedScale, and its direction may be up to ErrorDeg off (a random share of it).
+	UPROPERTY(BlueprintReadOnly, Category = "Kick") float SpeedScale = 1.f;
+	UPROPERTY(BlueprintReadOnly, Category = "Kick") float ErrorDeg = 0.f;
 };
 
 // Input of UBallContactResolver::ResolveContact (doc §6).
@@ -377,7 +590,7 @@ struct FBallResponseCommand {
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") bool bUseDesiredVelocity = false;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") FVector DesiredVelocity = FVector::ZeroVector;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") float MaxAllowedCorrection = 0.f;
-	// A spin set outright (deg/s): the legacy skill touch, until master plan Phase 6.
+	// A spin set outright (deg/s): a skill touch's physical response (velocity and spin worked out at once, applied as one SET).
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") bool bSetAngularVelocity = false;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response") FVector AngularVelocityDeg = FVector::ZeroVector;
 	// The state and owner after the response (§146); bSetStateAfter off leaves the state alone.
@@ -452,6 +665,9 @@ struct FSkillDebugSample {
 	UPROPERTY(BlueprintReadOnly, Category = "Football") float ContactDistance = 0.f;
 	UPROPERTY(BlueprintReadOnly, Category = "Football") FVector BodyPoint = FVector::ZeroVector;
 	UPROPERTY(BlueprintReadOnly, Category = "Football") FVector SurfacePoint = FVector::ZeroVector;
+	// The tracked body region's normal (toward the ball) and velocity this tick.
+	UPROPERTY(BlueprintReadOnly, Category = "Football") FVector ContactNormal = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Football") FVector BodyVelocity = FVector::ZeroVector;
 	UPROPERTY(BlueprintReadOnly, Category = "Football") FVector BallPos = FVector::ZeroVector;
 	UPROPERTY(BlueprintReadOnly, Category = "Football") FVector BallVel = FVector::ZeroVector;
 	// Where the skill wanted the ball this tick (approach spot, or where the last touch aimed).
@@ -460,9 +676,252 @@ struct FSkillDebugSample {
 	UPROPERTY(BlueprintReadOnly, Category = "Football") FVector TouchPhysical = FVector::ZeroVector;
 	UPROPERTY(BlueprintReadOnly, Category = "Football") FVector TouchNeeded = FVector::ZeroVector;
 	UPROPERTY(BlueprintReadOnly, Category = "Football") FVector TouchApplied = FVector::ZeroVector;
+	// The touch as an impulse: ball mass x (applied - velocity before), kg*cm/s (spec §104 "final impulse").
+	UPROPERTY(BlueprintReadOnly, Category = "Football") FVector TouchImpulse = FVector::ZeroVector;
+	// How far player alignment (spec §15) has moved the capsule so far, on top of the baked travel.
+	UPROPERTY(BlueprintReadOnly, Category = "Football") FVector AlignmentApplied = FVector::ZeroVector;
 	UPROPERTY(BlueprintReadOnly, Category = "Football") FVector ActorPos = FVector::ZeroVector;
 	UPROPERTY(BlueprintReadOnly, Category = "Football") float ActorYaw = 0.f;
 	UPROPERTY(BlueprintReadOnly, Category = "Football") FVector HipsPos = FVector::ZeroVector;
 	UPROPERTY(BlueprintReadOnly, Category = "Football") FVector LeftFootPos = FVector::ZeroVector;
 	UPROPERTY(BlueprintReadOnly, Category = "Football") FVector RightFootPos = FVector::ZeroVector;
+};
+
+// ---- The action layer (master spec §3, §15-16, §63-65, §71-73, §116-121; master plan Phase 5) --------------------------
+
+// Generic action state (spec §116). A skill's finer state (Redirecting...) stays on UFootballSkillComponent.
+UENUM(BlueprintType)
+enum class EActionState : uint8 { None, Requested, Validating, Starting, Aligning, Playing, Contacting, Releasing, Recovering, Completed, Cancelled, Interrupted };
+
+// Why an action ended early (spec §65); Superseded = a higher-priority action took over (§64). An action's
+// InterruptionProfile.AllowedReasons is a bitmask of these (bit = enum value).
+UENUM(BlueprintType, meta = (Bitflags))
+enum class EActionInterruptReason : uint8 { Cancelled, InterruptedByTackle, InterruptedByCollision, BallLost, PlayerStunned, InvalidState, Superseded };
+
+// The first validator (spec §119) that refused a request. Valid = it may start.
+UENUM(BlueprintType)
+enum class EActionValidation : uint8 {
+	Valid, UnknownAction, CannotPlay, InvalidState, Busy, Cooldown, WrongFoot, NoBall, BallState, NotOwner, TooFar, WrongDirection,
+	WrongSpeed, Unreachable, NoSpace
+};
+
+// How an action picks its direction (spec §3 DirectionMode): the input relative to the facing, snapped to the action's
+// AllowedDirections (skills, doc §28); the input itself; toward the target; along the camera.
+UENUM(BlueprintType)
+enum class EActionDirectionMode : uint8 { FacingSnapped, Input, Target, Camera };
+
+// What an action request carries (spec §117) and the situation it is judged in (§118). The caller fills the Request part;
+// UFootballActionComponent::RequestAction fills the Situation part when it takes the request (and again on every retry
+// from the input buffer, so a buffered request is judged by the situation it starts in).
+USTRUCT(BlueprintType)
+struct FActionContext {
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Request") FVector InputDirection = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Request") FVector TargetDirection = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Request") FVector TargetLocation = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Request") TObjectPtr<AActor> TargetActor = nullptr;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Request") TObjectPtr<AActor> BallActor = nullptr;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Request") float Power = 0.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Request") float Spin = 0.f;
+	// The left-foot (mirrored) version.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Request") bool bMirrored = false;
+
+	UPROPERTY(BlueprintReadWrite, Category = "Situation") FVector BallLocation = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadWrite, Category = "Situation") FVector BallVelocity = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadWrite, Category = "Situation") FVector PlayerLocation = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadWrite, Category = "Situation") FVector PlayerVelocity = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadWrite, Category = "Situation") FVector PlayerForward = FVector::ForwardVector;
+	UPROPERTY(BlueprintReadWrite, Category = "Situation") FVector PlayerRight = FVector::RightVector;
+	UPROPERTY(BlueprintReadWrite, Category = "Situation") FVector CameraDirection = FVector::ForwardVector;
+	// 0-1. Always 0 until there are opponents (master plan Phases 14-15).
+	UPROPERTY(BlueprintReadWrite, Category = "Situation") float OpponentPressure = 0.f;
+	// The player's strong foot (weak-foot rules, spec §61) and attributes (§62), from their UPlayerAttributesData.
+	UPROPERTY(BlueprintReadWrite, Category = "Situation") EFootSelection PreferredFoot = EFootSelection::Right;
+	UPROPERTY(BlueprintReadWrite, Category = "Situation") FFootballAttributes AttributeSnapshot;
+	// World seconds when the request was made (the input buffer's clock, §63).
+	UPROPERTY(BlueprintReadWrite, Category = "Situation") float RequestTime = 0.f;
+};
+
+// How far an action may move the player to the real ball (spec §15, §16, §120). The interim until there is root motion:
+// a bounded capsule move spread over a warp window on top of the baked travel, with targets shaped like Motion Warping's.
+USTRUCT(BlueprintType)
+struct FActionAlignmentProfile {
+	GENERATED_BODY()
+
+	// Move the PLAYER so each contact's expected ball offset (§71) lands on the real ball. Off = no correction at all: the
+	// action only starts when the ball is already where its first contact expects it.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") bool bAlignPlayer = false;
+	// Per contact: the most the capsule may be moved (cm) and turned at the start (degrees), and how fast (cm/s) - "do not
+	// over-warp". Beyond them the action falls back (§120).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment", meta = (ClampMin = "0")) float MaxPositionCorrection = 30.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment", meta = (ClampMin = "0", ClampMax = "90")) float MaxRotationCorrection = 20.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment", meta = (ClampMin = "1")) float MaxCorrectionSpeed = 250.f;
+	// Montage seconds the first warp window opens; it closes at the first contact's ContactTime.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment", meta = (ClampMin = "0")) float WarpStartTime = 0.f;
+	// Multi-contact actions re-align after each contact for the next one (position only: the turn is set at the start).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") bool bRealignBeforeEachContact = true;
+	// Entry momentum: the player keeps the velocity he had at the request (the dribble's) until the first contact, then it
+	// fades with EntryDecayTime (s), on top of the baked travel - a move done on the run instead of from a dead stop.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") bool bCarryEntryVelocity = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment", meta = (ClampMin = "0.01")) float EntryDecayTime = 0.15f;
+};
+
+// The result of UFootballActionComponent::CalculateAlignmentTarget (spec §120), named and shaped like a Motion Warping
+// target (§16) so the warp can take over from the interim capsule move later.
+USTRUCT(BlueprintType)
+struct FActionAlignmentTarget {
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Alignment") FName WarpTargetName;
+	UPROPERTY(BlueprintReadOnly, Category = "Alignment") int32 ContactIndex = INDEX_NONE;
+	// The clamped correction puts the ball within the contact's tolerance.
+	UPROPERTY(BlueprintReadOnly, Category = "Alignment") bool bReachable = false;
+	// Where the capsule's ground point should be, and the facing, at the contact (world).
+	UPROPERTY(BlueprintReadOnly, Category = "Alignment") FVector Location = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Alignment") FRotator Rotation = FRotator::ZeroRotator;
+	// The warp window (montage seconds).
+	UPROPERTY(BlueprintReadOnly, Category = "Alignment") float WindowStart = 0.f;
+	UPROPERTY(BlueprintReadOnly, Category = "Alignment") float WindowEnd = 0.f;
+	// The capsule move over the window (world, cm) and the turn folded into the start (yaw degrees, + = clockwise).
+	UPROPERTY(BlueprintReadOnly, Category = "Alignment") FVector PositionCorrection = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Alignment") float RotationCorrection = 0.f;
+	// The read-only prediction (§72) it worked from: the ball at the contact, and how long until then (s).
+	UPROPERTY(BlueprintReadOnly, Category = "Alignment") FVector PredictedBall = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Alignment") float TimeToContact = 0.f;
+	// Ball to expected spot before any correction, and what is left after the clamped one (cm).
+	UPROPERTY(BlueprintReadOnly, Category = "Alignment") float RequiredCorrection = 0.f;
+	UPROPERTY(BlueprintReadOnly, Category = "Alignment") float Residual = 0.f;
+};
+
+// Input of UFootballActionComponent::CalculateAlignmentTarget: everything it needs, so it runs without a world.
+USTRUCT(BlueprintType)
+struct FAlignmentQuery {
+	GENERATED_BODY()
+
+	// The ball at the contact (predicted, §72) and the capsule's ground point then without any correction, from the baked
+	// travel; EntryOffset is the entry momentum's share of that move, which keeps its real direction (a start turn doesn't
+	// swing it).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") FVector PredictedBall = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") FVector PredictedRoot = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") FVector EntryOffset = FVector::ZeroVector;
+	// The capsule's ground point now: a start turn swings the whole move about it.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") FVector Pivot = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") FSkillBasis Basis;
+	// The contact's ExpectedBallOffset (§71) and ContactTolerance.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") FVector ExpectedBallOffset = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") float Tolerance = 6.f;
+	// Real seconds until the contact (the warp window's length), and the window itself in montage seconds.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") float TimeAvailable = 0.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") float WindowStart = 0.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") float WindowEnd = 0.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") int32 ContactIndex = 0;
+	// Off for a re-alignment in the middle of an action (the turn is only set at its start).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") bool bAllowRotation = true;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Alignment") FActionAlignmentProfile Profile;
+};
+
+// Spec §65: which interruptions end this action early (Cancelled and InvalidState always do). With the Superseded bit a
+// higher-priority request may take over (§64).
+USTRUCT(BlueprintType)
+struct FActionInterruptionProfile {
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Interruption", meta = (Bitmask, BitmaskEnum = "/Script/FootballArena.EActionInterruptReason"))
+	int32 AllowedReasons = 0x7F;
+};
+
+// After the action: for RecoveryTime seconds a new request of the same or lower priority waits (buffered), and the normal
+// control (the dribble) takes the ball back after ResumeControlDelay seconds (0 = at once, as before master plan Phase 5).
+USTRUCT(BlueprintType)
+struct FActionRecoveryProfile {
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Recovery", meta = (ClampMin = "0")) float RecoveryTime = 0.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Recovery", meta = (ClampMin = "0")) float ResumeControlDelay = 0.f;
+};
+
+// Spec §14 / §105: scales on top of each contact's own assist values, and whether the player's skill scales them through
+// UBallAssist::ScaleForSkill. Read from master plan Phase 6 on (the converted Elastico is the first user).
+USTRUCT(BlueprintType)
+struct FActionAssistProfile {
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Assist", meta = (ClampMin = "0")) float StrengthScale = 1.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Assist", meta = (ClampMin = "0")) float BoundsScale = 1.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Assist") bool bScaleWithPlayerSkill = true;
+};
+
+// Spec §62: which of the player's attributes (FFootballAttributes property names) drive this action's assist and its
+// contact quality. Read from master plan Phase 6 on.
+USTRUCT(BlueprintType)
+struct FActionAttributeProfile {
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Attributes") FName AssistAttribute = TEXT("SkillMoves");
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Attributes") FName QualityAttribute = TEXT("BallControl");
+};
+
+// Spec §122: scales on top of the body region's surface values (DT_BodyRegions) for this action's raw responses, and the
+// body's effective contact strength (FBallResponseInput). Read from master plan Phase 6 on (the raw touches).
+USTRUCT(BlueprintType)
+struct FActionBallResponseProfile {
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response", meta = (ClampMin = "0")) float RestitutionScale = 1.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response", meta = (ClampMin = "0")) float FrictionScale = 1.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Response", meta = (ClampMin = "0", ClampMax = "1")) float ContactStrength = 1.f;
+};
+
+// What the validators (spec §119) look at, gathered by UFootballActionComponent so the rules themselves (ValidateAction)
+// run without a world in the self-test.
+USTRUCT(BlueprintType)
+struct FActionValidationInput {
+	GENERATED_BODY()
+
+	// ValidateState: the player can act (on the ground, not stunned); the running action's priority (-1 = none) and whether
+	// it is protected from being taken over (no Superseded bit); still recovering from an action of this priority (-1 = no).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation") bool bPlayerCanAct = true;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation") int32 ActivePriority = -1;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation") bool bActiveProtected = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation") int32 RecoveringPriority = -1;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation") float CooldownLeft = 0.f;
+	// ValidateBall / Ownership / Distance: a simulated ball with BallMovement + BallState; its state machine allows the
+	// action's ball state; another character controls or receives it; its ground distance to the player (cm).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation") bool bBallValid = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation") bool bBallStateAllows = true;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation") bool bBallOwnedByOther = false;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation") float BallDistance = 0.f;
+	// ValidateDirection: the direction mode found a direction. ValidateSpeed: the player's speed (cm/s).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation") bool bHasDirection = true;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation") float PlayerSpeed = 0.f;
+	// ValidateReachability (§72-73) and ValidateCollisionSpace.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation") bool bReachable = true;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Validation") bool bSpaceFree = true;
+};
+
+// One recorded tick of an action (spec §104), read back by tests and debugging.
+USTRUCT(BlueprintType)
+struct FActionRecordSample {
+	GENERATED_BODY()
+
+	// Seconds since the action started.
+	UPROPERTY(BlueprintReadOnly, Category = "Action") float Time = 0.f;
+	UPROPERTY(BlueprintReadOnly, Category = "Action") FGameplayTag ActionTag;
+	UPROPERTY(BlueprintReadOnly, Category = "Action") EActionState State = EActionState::None;
+	UPROPERTY(BlueprintReadOnly, Category = "Action") FTransform PlayerTransform;
+	UPROPERTY(BlueprintReadOnly, Category = "Action") FVector PlayerVelocity = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Action") FTransform BallTransform;
+	UPROPERTY(BlueprintReadOnly, Category = "Action") FVector BallVelocity = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Action") FVector BallAngularVelocity = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Action") int32 ContactIndex = -1;
+	UPROPERTY(BlueprintReadOnly, Category = "Action") EContactValidation ContactValidity = EContactValidation::Valid;
+	UPROPERTY(BlueprintReadOnly, Category = "Action") FVector ContactPoint = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Action") FVector ContactNormal = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Action") FVector BodyVelocity = FVector::ZeroVector;
+	// On a touch's tick: the raw physical result, the assisted one, and the impulse finally given (kg*cm/s).
+	UPROPERTY(BlueprintReadOnly, Category = "Action") FVector RawResponse = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Action") FVector AssistedResponse = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Action") FVector FinalImpulse = FVector::ZeroVector;
+	UPROPERTY(BlueprintReadOnly, Category = "Action") FVector AlignmentCorrection = FVector::ZeroVector;
 };
