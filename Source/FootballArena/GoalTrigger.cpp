@@ -4,7 +4,7 @@
 AGoalTrigger::AGoalTrigger() {
 	TriggerBox = CreateDefaultSubobject<UBoxComponent>(TEXT("TriggerBox"));
 	RootComponent = TriggerBox;
-	TriggerBox->SetBoxExtent(FVector(15.0f, 440.0f, 150.0f));
+	TriggerBox->SetBoxExtent(FVector(15.0f, 353.0f, 120.5f)); // inside a real 7.32 x 2.44 m goal
 	TriggerBox->SetCollisionProfileName(TEXT("Trigger"));
 	TriggerBox->SetCollisionResponseToChannel(ECC_GameTraceChannel1, ECR_Overlap);
 

@@ -39,7 +39,7 @@ FVector UFootballLibrary::GetAimAssistedDirection(FVector AimDirection, FVector 
 	// GoalCentre must match the (5270,0,150) literal wired into BP_FootballPlayer's Tick
 	// (feeds the ToGoalCenter pin here) - if that spawn point ever moves, update both.
 	const FVector GoalCentre(5270.0f, 0.0f, 150.0f);
-	const float GoalHalfWidth = 420.0f; // posts are at +-458.7; a small inset so the target isn't ON the post
+	const float GoalHalfWidth = 333.0f; // real 7.32 m goal: post inner faces at +-366; a small inset so the target isn't ON the post
 	const FVector PlayerLocation = GoalCentre - ToGoalCenterRaw;
 
 	float TargetY = GoalCentre.Y;
