@@ -65,6 +65,17 @@ docs/
 # hand-authored source, and may contain personal capture footage.
 Content/CaptureManager/
 
+# ---- Generated and downloaded animation data, too big for this repo ----
+# MetaHuman solves of source videos and the physics-training clip library are
+# pipeline output that can be rebuilt; the rest is downloaded sample content.
+Content/Football/MHA/
+Content/RL_Data/
+Content/Mocap_Pack_05_Soccer/
+Content/GameAnimSample/
+Content/Blueprints/
+Content/Audio/
+Content/Misc/
+
 # ---- Python bytecode from the editor tools ----
 __pycache__/
 
