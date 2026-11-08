@@ -1,6 +1,7 @@
-"""The other 19 tutorial clips, fastest with the ball first: ingest -> solve -> export and retarget -> raw bone data, using the project's queues with their globals pointed at the
-test folders, so the 115 old clips and their logs stay untouched. Chained on editor ticks and kept in a module, so it goes on by itself once start() has been called.
-Progress: Saved/MHAQueue/dribbletest_batch.json; each queue also keeps its own dribbletest_*5.json. Rows land in RL_Train/data/tutorial_clips.json as each clip finishes."""
+"""Tutorial clips in batches (BATCHES): ingest -> solve -> export and retarget -> raw bone data, using the project's queues with their globals pointed at the
+test folders, so the 115 old clips and their logs stay untouched. Chained on editor ticks and kept in a module, so it goes on by itself once start(batch) has been called.
+Progress: Saved/MHAQueue/dribbletest_batch<N>.json; each queue also keeps its own dribbletest_*<N>.json. Rows land in RL_Train/data/tutorial_clips_b<N>.json
+as each clip finishes (batch 5: tutorial_clips.json)."""
 import json, os, sys, time
 import unreal
 T = 'D:/Football Game/Real Project/FootballArena 5.8/Tools'
@@ -11,15 +12,26 @@ import mha_perf_queue as pq
 import rl_export_mha as eq
 import rl_export_motion as m
 
-CLIPS = ['B5_Y6', 'B5_Y5', 'B6b_Y2', 'B6b_Y1', 'B6b_Y3', 'B5_Y1', 'B5_Y2', 'B5_Y3', 'B4_Y1', 'B4_Y2', 'B4_Y3', 'B4_Y5', 'B4_Y6', 'B4_Y7', 'B4_Y8', 'B4_Y9', 'B4_Y10', 'B2_Y1', 'B2_Y2']
+# Batch 5 (2026-11-07) wrote data/tutorial_clips.json and the *5.json logs; each later batch writes its own rows file and logs, merged into tutorial_clips.json afterwards.
+BATCHES = {5: ['B5_Y6', 'B5_Y5', 'B6b_Y2', 'B6b_Y1', 'B6b_Y3', 'B5_Y1', 'B5_Y2', 'B5_Y3', 'B4_Y1', 'B4_Y2', 'B4_Y3', 'B4_Y5', 'B4_Y6', 'B4_Y7', 'B4_Y8', 'B4_Y9', 'B4_Y10', 'B2_Y1', 'B2_Y2'],
+           6: ['B5_Y8', 'B10_Y1', 'B12_Y1', 'B18_Y1', 'B9_Y1', 'B18_Y2', 'B12_Y2', 'B12_Y3', 'B8_Y1', 'B8_Y2', 'B8_Y3', 'B8_Y4', 'B10_Y2', 'B10_Y3', 'B10_Y4'],
+           7: ['B12_Y4', 'B18_Y3', 'B9_Y2', 'B9_Y3', 'B18_Y4', 'B12_Y5', 'B8_Y5', 'B8_Y6', 'B12_Y6', 'B12_Y7']}
+CLIPS = []
 ROOT = '/Game/Football/MHA/DribbleTest'
 SAVED = os.path.join(unreal.Paths.project_saved_dir(), 'MHAQueue')
-ROWS = 'D:/Football Game/RL_Train/data/tutorial_clips.json'
-STATUS = os.path.join(SAVED, 'dribbletest_batch.json')
+ROWS = STATUS = None
 EAL = unreal.EditorAssetLibrary
-iq.ASSET_DIR, iq.MEDIA_DIR, iq.LOG = ROOT + '/CaptureData/{slate}', 'D:/Football Game/MHA_Media_Dribble/{slate}', os.path.join(SAVED, 'dribbletest_ingest5.json')
-pq.CD_DIR, pq.PERF_DIR, pq.LOG = ROOT + '/CaptureData', ROOT + '/Performances', os.path.join(SAVED, 'dribbletest_perf5.json')
-eq.PERF_DIR, eq.MH_DIR, eq.OUT_DIR, eq.LOG = ROOT + '/Performances', ROOT + '/Exports_MH', ROOT + '/Footballer', os.path.join(SAVED, 'dribbletest_export5.json')
+iq.ASSET_DIR, iq.MEDIA_DIR = ROOT + '/CaptureData/{slate}', 'D:/Football Game/MHA_Media_Dribble/{slate}'
+pq.CD_DIR, pq.PERF_DIR = ROOT + '/CaptureData', ROOT + '/Performances'
+eq.PERF_DIR, eq.MH_DIR, eq.OUT_DIR = ROOT + '/Performances', ROOT + '/Exports_MH', ROOT + '/Footballer'
+
+
+def _use(batch):
+    global ROWS, STATUS
+    CLIPS[:] = BATCHES[batch]
+    ROWS = 'D:/Football Game/RL_Train/data/tutorial_clips%s.json' % ('' if batch == 5 else '_b%d' % batch)
+    STATUS = os.path.join(SAVED, 'dribbletest_batch%s.json' % ('' if batch == 5 else batch))
+    iq.LOG, pq.LOG, eq.LOG = (os.path.join(SAVED, 'dribbletest_%s%d.json' % (s, batch)) for s in ('ingest', 'perf', 'export'))
 c = {}
 _h = {}
 
@@ -116,9 +128,10 @@ def _tick(dt):
         c['busy'] = False
 
 
-def start():
+def start(batch):
     if _h.get('tick') is not None:
         return 'already running: ' + c['stage']
+    _use(batch)
     c.clear()
     c.update(stage='ingest', started=time.strftime('%H:%M:%S'), rows=[], left=[], errors=[], clips=len(CLIPS))
     _save()
